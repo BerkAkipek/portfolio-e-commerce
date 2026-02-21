@@ -1,7 +1,65 @@
-dev:
+.PHONY: dev up build rebuild down stop restart ps logs logs-api logs-web logs-db logs-migrate \
+	seed-products db-shell migrate-status health check-api check-web clean \
+	api web build-api build-web
+
+dev: up
+
+up:
 	docker compose up -d
-	cd apps/api && go run ./cmd/server
-	cd apps/web && npm run dev
+
+build:
+	docker compose build
+
+rebuild:
+	docker compose up -d --build
+
+down:
+	docker compose down
+
+stop:
+	docker compose stop
+
+restart:
+	docker compose restart
+
+ps:
+	docker compose ps
+
+logs:
+	docker compose logs -f
+
+logs-api:
+	docker compose logs -f api
+
+logs-web:
+	docker compose logs -f web
+
+logs-db:
+	docker compose logs -f db
+
+logs-migrate:
+	docker compose logs -f migrate
+
+db-shell:
+	docker compose exec db psql postgresql://postgres:postgres@localhost:5432/ecommerce
+
+migrate-status:
+	docker compose exec db psql postgresql://postgres:postgres@localhost:5432/ecommerce -c "SELECT version, applied_at FROM schema_migrations ORDER BY version;"
+
+seed-products:
+	docker compose exec -T db psql postgresql://postgres:postgres@localhost:5432/ecommerce -c "INSERT INTO products (name, slug, description, price_cents, currency, stock, is_active, sku) VALUES ('Basic Tee','basic-tee','Simple t-shirt',1999,'USD',10,TRUE,'TEE-001') ON CONFLICT DO NOTHING;"
+
+health:
+	curl -i http://localhost:8080/health
+
+check-api:
+	curl -i http://localhost:8080/products
+
+check-web:
+	curl -I http://localhost:3000
+
+clean:
+	docker compose down -v
 
 api:
 	cd apps/api && go run ./cmd/server
