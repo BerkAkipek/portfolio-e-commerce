@@ -1,0 +1,17 @@
+{
+  "name": "e-commerce-app",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev:web",
+    "dev:web": "npm --workspace apps/web run dev",
+    "build": "npm run build:web",
+    "build:web": "npm --workspace apps/web run build",
+    "lint": "npm run lint:web",
+    "lint:web": "npm --workspace apps/web run lint"
+  }
+}

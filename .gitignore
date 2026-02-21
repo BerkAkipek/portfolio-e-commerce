@@ -1,0 +1,19 @@
+node_modules/
+.env
+.env.*
+dist/
+build/
+tmp/
+*.log
+.DS_Store
+
+# Go
+bin/
+vendor/
+
+# Next
+.next/
+
+# IDE
+.vscode/
+.idea/
