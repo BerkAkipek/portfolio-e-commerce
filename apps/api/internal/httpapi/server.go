@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/mail"
 	"net/url"
 	"os"
 	"strconv"
@@ -20,6 +21,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
+	"golang.org/x/crypto/bcrypt"
 
 	db "github.com/BerkAkipek/e-commerce-app/api/internal/db"
 )
@@ -27,6 +30,16 @@ import (
 type ProductQuerier interface {
 	ListActiveProducts(ctx context.Context, arg db.ListActiveProductsParams) ([]db.Product, error)
 	GetProductBySlug(ctx context.Context, lower string) (db.Product, error)
+	GetActiveCartByUserID(ctx context.Context, userID uuid.UUID) (db.Cart, error)
+	GetActiveCartBySessionID(ctx context.Context, sessionID string) (db.Cart, error)
+	CreateCart(ctx context.Context, arg db.CreateCartParams) (db.Cart, error)
+	GetUserByID(ctx context.Context, id uuid.UUID) (db.User, error)
+	GetUserByEmail(ctx context.Context, lower string) (db.User, error)
+	CreateUser(ctx context.Context, arg db.CreateUserParams) (db.User, error)
+	CreateRefreshToken(ctx context.Context, arg db.CreateRefreshTokenParams) (db.RefreshToken, error)
+	GetRefreshTokenByHash(ctx context.Context, tokenHash string) (db.RefreshToken, error)
+	RevokeRefreshTokenByHash(ctx context.Context, tokenHash string) (db.RefreshToken, error)
+	RotateRefreshToken(ctx context.Context, arg db.RotateRefreshTokenParams) (db.RefreshToken, error)
 	GetCartByID(ctx context.Context, id uuid.UUID) (db.Cart, error)
 	GetProductByID(ctx context.Context, id uuid.UUID) (db.Product, error)
 	GetCartItemByID(ctx context.Context, id uuid.UUID) (db.CartItem, error)
@@ -44,19 +57,44 @@ type ProductQuerier interface {
 
 type Server struct {
 	products ProductQuerier
+	carts    *CartService
 	stripe   stripeGateway
+	jwt      *JWTUtility
 }
 
+const (
+	defaultAccessTokenTTL  = 15 * time.Minute
+	defaultRefreshTokenTTL = 30 * 24 * time.Hour
+	defaultJWTIssuer       = "ecommerce-api"
+	defaultBcryptCost      = 12
+)
+
 func NewServer(products ProductQuerier) *Server {
+	var jwtUtil *JWTUtility
+	if jwtSecret := os.Getenv("JWT_SECRET"); strings.TrimSpace(jwtSecret) != "" {
+		issuer := strings.TrimSpace(os.Getenv("JWT_ISSUER"))
+		if issuer == "" {
+			issuer = defaultJWTIssuer
+		}
+		util, err := NewJWTUtility(jwtSecret, defaultAccessTokenTTL, issuer)
+		if err == nil {
+			jwtUtil = util
+		}
+	}
+
 	return &Server{
 		products: products,
+		carts:    NewCartService(products),
 		stripe:   newStripeGateway(http.DefaultClient),
+		jwt:      jwtUtil,
 	}
 }
 
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.StripSlashes)
+	r.Use(s.resolveAuthUser)
+	r.Use(s.resolveGuestSession)
 
 	s.registerRoutes(r)
 	r.Route("/api", func(api chi.Router) {
@@ -69,11 +107,15 @@ func (s *Server) registerRoutes(r chi.Router) {
 	r.Get("/health", s.handleHealth)
 	r.Get("/products", s.handleListProducts)
 	r.Get("/products/{slug}", s.handleGetProductBySlug)
+	r.Post("/auth/register", s.handleRegister)
+	r.Post("/auth/login", s.handleLogin)
+	r.Post("/auth/dev-login", s.handleDevLogin)
+	r.Post("/auth/logout", s.handleLogout)
 	r.Post("/cart/items", s.handleCreateCartItem)
 	r.Patch("/cart/items/{id}", s.handlePatchCartItem)
 	r.Delete("/cart/items/{id}", s.handleDeleteCartItem)
 	r.Get("/cart/{id}/items", s.handleGetCartItems)
-	r.Post("/checkout/session", s.handleCreateCheckoutSession)
+	r.With(s.requireAuth).Post("/checkout/session", s.handleCreateCheckoutSession)
 	r.Post("/webhooks/stripe", s.handleStripeWebhook)
 }
 
@@ -102,7 +144,6 @@ type productDTO struct {
 }
 
 type createCartItemRequest struct {
-	CartID    string `json:"cart_id"`
 	ProductID string `json:"product_id"`
 	Quantity  int32  `json:"quantity"`
 }
@@ -130,9 +171,23 @@ type cartItemsResponse struct {
 }
 
 type createCheckoutSessionRequest struct {
-	CartID     string `json:"cart_id"`
 	SuccessURL string `json:"success_url"`
 	CancelURL  string `json:"cancel_url"`
+}
+
+type devLoginRequest struct {
+	UserID string `json:"user_id"`
+}
+
+type loginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type registerRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+	FullName string `json:"full_name"`
 }
 
 type checkoutSessionResponse struct {
@@ -201,28 +256,14 @@ func (s *Server) handleCreateCartItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cartID, err := uuid.Parse(req.CartID)
+	cartID, err := s.carts.ResolveCart(r.Context())
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "cart_id must be a valid uuid")
+		writeError(w, http.StatusInternalServerError, "failed to resolve cart")
 		return
 	}
 	productID, err := uuid.Parse(req.ProductID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "product_id must be a valid uuid")
-		return
-	}
-
-	cart, err := s.products.GetCartByID(r.Context(), cartID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			writeError(w, http.StatusNotFound, "cart not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to get cart")
-		return
-	}
-	if cart.Status != "active" {
-		writeError(w, http.StatusConflict, "cart is not active")
 		return
 	}
 
@@ -285,19 +326,23 @@ func (s *Server) handleCreateCartItem(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetCartItems(w http.ResponseWriter, r *http.Request) {
 	cartIDRaw := chi.URLParam(r, "id")
-	cartID, err := uuid.Parse(cartIDRaw)
+	requestCartID, err := uuid.Parse(cartIDRaw)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "id must be a valid uuid")
 		return
 	}
 
-	_, err = s.products.GetCartByID(r.Context(), cartID)
+	cartID, err := s.carts.ResolveExistingCart(r.Context())
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(err, ErrActiveCartNotFound) {
 			writeError(w, http.StatusNotFound, "cart not found")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "failed to get cart")
+		writeError(w, http.StatusInternalServerError, "failed to resolve cart")
+		return
+	}
+	if requestCartID != cartID {
+		writeError(w, http.StatusNotFound, "cart not found")
 		return
 	}
 
@@ -333,6 +378,16 @@ func (s *Server) handlePatchCartItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	resolvedCartID, err := s.carts.ResolveExistingCart(r.Context())
+	if err != nil {
+		if errors.Is(err, ErrActiveCartNotFound) {
+			writeError(w, http.StatusNotFound, "cart item not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to resolve cart")
+		return
+	}
+
 	item, err := s.products.GetCartItemByID(r.Context(), cartItemID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -343,17 +398,8 @@ func (s *Server) handlePatchCartItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cart, err := s.products.GetCartByID(r.Context(), item.CartID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			writeError(w, http.StatusNotFound, "cart not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to get cart")
-		return
-	}
-	if cart.Status != "active" {
-		writeError(w, http.StatusConflict, "cart is not active")
+	if item.CartID != resolvedCartID {
+		writeError(w, http.StatusNotFound, "cart item not found")
 		return
 	}
 
@@ -379,6 +425,16 @@ func (s *Server) handleDeleteCartItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	resolvedCartID, err := s.carts.ResolveExistingCart(r.Context())
+	if err != nil {
+		if errors.Is(err, ErrActiveCartNotFound) {
+			writeError(w, http.StatusNotFound, "cart item not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to resolve cart")
+		return
+	}
+
 	item, err := s.products.GetCartItemByID(r.Context(), cartItemID)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -389,17 +445,8 @@ func (s *Server) handleDeleteCartItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cart, err := s.products.GetCartByID(r.Context(), item.CartID)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			writeError(w, http.StatusNotFound, "cart not found")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, "failed to get cart")
-		return
-	}
-	if cart.Status != "active" {
-		writeError(w, http.StatusConflict, "cart is not active")
+	if item.CartID != resolvedCartID {
+		writeError(w, http.StatusNotFound, "cart item not found")
 		return
 	}
 
@@ -411,6 +458,181 @@ func (s *Server) handleDeleteCartItem(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) handleDevLogin(w http.ResponseWriter, r *http.Request) {
+	if !isDevelopmentAuthEnabled() {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if s.jwt == nil {
+		writeError(w, http.StatusServiceUnavailable, "jwt auth is not configured")
+		return
+	}
+
+	var req devLoginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	userID, err := uuid.Parse(req.UserID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "user_id must be a valid uuid")
+		return
+	}
+
+	_, err = s.products.GetUserByID(r.Context(), userID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "user not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get user")
+		return
+	}
+
+	if err := s.issueAuthSession(r.Context(), w, userID); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"user_id": userID.String()})
+}
+
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	if s.jwt == nil {
+		writeError(w, http.StatusServiceUnavailable, "jwt auth is not configured")
+		return
+	}
+
+	var req loginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	email := strings.TrimSpace(req.Email)
+	if email == "" || req.Password == "" {
+		writeError(w, http.StatusBadRequest, "email and password are required")
+		return
+	}
+
+	user, err := s.products.GetUserByEmail(r.Context(), email)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusUnauthorized, "invalid credentials")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get user")
+		return
+	}
+	if !user.PasswordHash.Valid || strings.TrimSpace(user.PasswordHash.String) == "" {
+		writeError(w, http.StatusUnauthorized, "invalid credentials")
+		return
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash.String), []byte(req.Password)); err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid credentials")
+		return
+	}
+
+	if err := s.issueAuthSession(r.Context(), w, user.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+}
+
+func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	if s.jwt == nil {
+		writeError(w, http.StatusServiceUnavailable, "jwt auth is not configured")
+		return
+	}
+
+	var req registerRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	email := strings.TrimSpace(req.Email)
+	password := req.Password
+	fullName := strings.TrimSpace(req.FullName)
+	if _, err := mail.ParseAddress(email); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid email")
+		return
+	}
+	if len(password) < 8 {
+		writeError(w, http.StatusBadRequest, "password must be at least 8 characters")
+		return
+	}
+	if fullName == "" {
+		writeError(w, http.StatusBadRequest, "full_name is required")
+		return
+	}
+
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte(password), defaultBcryptCost)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to hash password")
+		return
+	}
+
+	user, err := s.products.CreateUser(r.Context(), db.CreateUserParams{
+		Email:        email,
+		PasswordHash: sql.NullString{String: string(passwordHash), Valid: true},
+		Phone:        sql.NullString{},
+		FullName:     fullName,
+		Role:         "user",
+	})
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			writeError(w, http.StatusConflict, "email already registered")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to create user")
+		return
+	}
+
+	if err := s.issueAuthSession(r.Context(), w, user.ID); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+}
+
+func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
+	if rawToken, err := ReadRefreshCookie(r); err == nil {
+		if tokenHash, hashErr := HashRefreshToken(rawToken); hashErr == nil {
+			_, _ = s.products.RevokeRefreshTokenByHash(r.Context(), tokenHash)
+		}
+	}
+	ClearAuthCookies(w)
+	writeJSON(w, http.StatusOK, map[string]bool{"success": true})
+}
+
+func (s *Server) issueAuthSession(ctx context.Context, w http.ResponseWriter, userID uuid.UUID) error {
+	token, err := s.jwt.CreateToken(userID)
+	if err != nil {
+		return errors.New("failed to create auth token")
+	}
+
+	refreshTokenRaw, err := GenerateRefreshToken()
+	if err != nil {
+		return errors.New("failed to create refresh token")
+	}
+	refreshTokenHash, err := HashRefreshToken(refreshTokenRaw)
+	if err != nil {
+		return errors.New("failed to hash refresh token")
+	}
+	if _, err := s.products.CreateRefreshToken(ctx, db.CreateRefreshTokenParams{
+		UserID:    userID,
+		TokenHash: refreshTokenHash,
+		ExpiresAt: time.Now().UTC().Add(defaultRefreshTokenTTL),
+	}); err != nil {
+		return errors.New("failed to persist refresh token")
+	}
+	SetAuthCookies(w, token, defaultAccessTokenTTL, refreshTokenRaw, defaultRefreshTokenTTL)
+	return nil
+}
+
 func (s *Server) handleCreateCheckoutSession(w http.ResponseWriter, r *http.Request) {
 	var req createCheckoutSessionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -418,27 +640,19 @@ func (s *Server) handleCreateCheckoutSession(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	cartID, err := uuid.Parse(req.CartID)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "cart_id must be a valid uuid")
+	userID, ok := AuthUserIDFromContext(r.Context())
+	if !ok || userID == uuid.Nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
 
-	cart, err := s.products.GetCartByID(r.Context(), cartID)
+	cartID, err := s.carts.ResolveExistingCart(r.Context())
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			writeError(w, http.StatusNotFound, "cart not found")
+		if errors.Is(err, ErrActiveCartNotFound) {
+			writeError(w, http.StatusBadRequest, "cart is empty")
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "failed to get cart")
-		return
-	}
-	if cart.Status != "active" {
-		writeError(w, http.StatusConflict, "cart is not active")
-		return
-	}
-	if !cart.UserID.Valid {
-		writeError(w, http.StatusBadRequest, "cart must be attached to a user for checkout")
+		writeError(w, http.StatusInternalServerError, "failed to resolve cart")
 		return
 	}
 
@@ -511,7 +725,7 @@ func (s *Server) handleCreateCheckoutSession(w http.ResponseWriter, r *http.Requ
 		LineItems:  lineItems,
 		Metadata: map[string]string{
 			"cart_id": cartID.String(),
-			"user_id": cart.UserID.UUID.String(),
+			"user_id": userID.String(),
 		},
 	})
 	if err != nil {

@@ -59,6 +59,8 @@ services:
     environment:
       DATABASE_URL: postgres://postgres:postgres@db:5432/ecommerce?sslmode=disable
       PORT: "8080"
+      JWT_SECRET: dev-local-jwt-secret
+      APP_ENV: development
     ports:
       - "8080:8080"
 

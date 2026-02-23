@@ -1,6 +1,6 @@
 .PHONY: dev up build rebuild down stop restart ps logs logs-api logs-web logs-db logs-migrate \
 	seed-products db-shell migrate-status health check-api check-web clean \
-	api web build-api build-web
+	api web build-api build-web test-api test-api-verbose test-api-smoke
 
 dev: up
 
@@ -72,3 +72,12 @@ build-api:
 
 build-web:
 	cd apps/web && npm run build
+
+test-api:
+	cd apps/api && GOCACHE=/tmp/go-build-cache go test ./...
+
+test-api-verbose:
+	cd apps/api && GOCACHE=/tmp/go-build-cache go test -v ./...
+
+test-api-smoke:
+	cd apps/api && GOCACHE=/tmp/go-build-cache go test -v ./internal/httpapi -run Smoke

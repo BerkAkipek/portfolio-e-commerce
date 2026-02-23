@@ -107,6 +107,15 @@ erDiagram
         text payment_intent_id "nullable"
     }
 
+    REFRESH_TOKENS {
+        uuid id PK
+        uuid user_id "FK -> users.id"
+        text token_hash
+        timestamptz expires_at
+        boolean revoked
+        timestamptz created_at
+    }
+
     USERS ||--o{ CARTS : owns
     USERS ||--o{ ORDERS : places
     ORDERS ||--o{ ORDER_ITEMS : contains
@@ -116,6 +125,7 @@ erDiagram
     PRODUCTS ||--o{ CART_ITEMS : referenced_by
 
     ORDERS ||--o{ PAYMENTS : paid_by
+    USERS ||--o{ REFRESH_TOKENS : has
 
     PRODUCTS ||--o{ PRODUCT_CATEGORIES : linked
     CATEGORIES ||--o{ PRODUCT_CATEGORIES : linked
@@ -138,3 +148,4 @@ erDiagram
   - (`provider`, `provider_payment_id`) when payment id is present
   - `checkout_session_id` when present
   - `payment_intent_id` when present
+- `refresh_tokens.token_hash` stores hashed refresh tokens only (never raw refresh tokens) and is unique.
