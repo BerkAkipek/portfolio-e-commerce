@@ -5,30 +5,37 @@ function getApiBaseURL(): string {
   return base && base.length > 0 ? base : "http://localhost:8080";
 }
 
-export async function GET(
-  _request: NextRequest,
-  context: { params: Promise<{ slug: string }> },
-) {
-  const { slug } = await context.params;
-  const upstreamURL = new URL(`/products/${encodeURIComponent(slug)}`, getApiBaseURL());
+export async function POST(request: NextRequest) {
+  const upstreamURL = new URL("/checkout/session", getApiBaseURL());
 
   try {
+    const rawBody = await request.text();
     const response = await fetch(upstreamURL, {
-      method: "GET",
+      method: "POST",
       cache: "no-store",
-      headers: { Accept: "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        Cookie: request.headers.get("cookie") ?? "",
+      },
+      body: rawBody,
     });
 
     const payload = await response.text();
     const proxied = new NextResponse(payload, { status: response.status });
+
     const contentType = response.headers.get("content-type");
     if (contentType) {
       proxied.headers.set("content-type", contentType);
     }
+    const setCookie = response.headers.get("set-cookie");
+    if (setCookie) {
+      proxied.headers.set("set-cookie", setCookie);
+    }
     return proxied;
   } catch {
     return NextResponse.json(
-      { error: "unable to reach product service" },
+      { error: "unable to reach checkout service" },
       { status: 502 },
     );
   }

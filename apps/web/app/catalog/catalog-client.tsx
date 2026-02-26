@@ -37,11 +37,28 @@ function formatPrice(priceCents: number, currency: string): string {
 }
 
 async function fetchProducts(): Promise<ProductsResponse> {
-  const response = await fetch("/api/products?limit=100&offset=0");
-  if (!response.ok) {
-    throw new Error("failed to load products");
+  const pageSize = 100;
+  const allProducts: Product[] = [];
+
+  for (let page = 0; page < 50; page += 1) {
+    const offset = page * pageSize;
+    const response = await fetch(`/api/products?limit=${pageSize}&offset=${offset}`);
+    if (!response.ok) {
+      throw new Error("failed to load products");
+    }
+    const payload = (await response.json()) as ProductsResponse;
+    const batch = payload.data ?? [];
+    allProducts.push(...batch);
+    if (batch.length < pageSize) {
+      break;
+    }
   }
-  return (await response.json()) as ProductsResponse;
+
+  return {
+    data: allProducts,
+    limit: allProducts.length,
+    offset: 0,
+  };
 }
 
 function ProductSkeletonCard() {

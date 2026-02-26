@@ -30,6 +30,7 @@ import (
 type ProductQuerier interface {
 	ListActiveProducts(ctx context.Context, arg db.ListActiveProductsParams) ([]db.Product, error)
 	GetProductBySlug(ctx context.Context, lower string) (db.Product, error)
+	ListCategoriesByProductID(ctx context.Context, productID uuid.UUID) ([]db.Category, error)
 	GetActiveCartByUserID(ctx context.Context, userID uuid.UUID) (db.Cart, error)
 	GetActiveCartBySessionID(ctx context.Context, sessionID string) (db.Cart, error)
 	CreateCart(ctx context.Context, arg db.CreateCartParams) (db.Cart, error)
@@ -49,10 +50,13 @@ type ProductQuerier interface {
 	UpdateCartItemQuantity(ctx context.Context, arg db.UpdateCartItemQuantityParams) (db.CartItem, error)
 	RemoveCartItem(ctx context.Context, id uuid.UUID) error
 	CreateOrder(ctx context.Context, arg db.CreateOrderParams) (db.Order, error)
+	ListOrdersByUserID(ctx context.Context, arg db.ListOrdersByUserIDParams) ([]db.Order, error)
 	CreateOrderItem(ctx context.Context, arg db.CreateOrderItemParams) (db.OrderItem, error)
 	CreatePayment(ctx context.Context, arg db.CreatePaymentParams) (db.Payment, error)
 	GetPaymentByCheckoutSessionID(ctx context.Context, checkoutSessionID string) (db.Payment, error)
 	UpdateCartStatus(ctx context.Context, arg db.UpdateCartStatusParams) (db.Cart, error)
+	GetOrderByID(ctx context.Context, id uuid.UUID) (db.Order, error)
+	ListOrderItemsByOrderID(ctx context.Context, orderID uuid.UUID) ([]db.OrderItem, error)
 }
 
 type Server struct {
@@ -60,6 +64,7 @@ type Server struct {
 	carts    *CartService
 	stripe   stripeGateway
 	jwt      *JWTUtility
+	http     *http.Client
 }
 
 const (
@@ -87,6 +92,7 @@ func NewServer(products ProductQuerier) *Server {
 		carts:    NewCartService(products),
 		stripe:   newStripeGateway(http.DefaultClient),
 		jwt:      jwtUtil,
+		http:     http.DefaultClient,
 	}
 }
 
@@ -107,8 +113,12 @@ func (s *Server) registerRoutes(r chi.Router) {
 	r.Get("/health", s.handleHealth)
 	r.Get("/products", s.handleListProducts)
 	r.Get("/products/{slug}", s.handleGetProductBySlug)
+	r.With(s.requireAuth).Get("/orders", s.handleListOrdersByUser)
+	r.With(s.requireAuth).Get("/orders/{id}", s.handleGetOrderByID)
 	r.Post("/auth/register", s.handleRegister)
 	r.Post("/auth/login", s.handleLogin)
+	r.Get("/auth/google/start", s.handleGoogleAuthStart)
+	r.Get("/auth/google/callback", s.handleGoogleAuthCallback)
 	r.Post("/auth/dev-login", s.handleDevLogin)
 	r.Post("/auth/logout", s.handleLogout)
 	r.Post("/cart/items", s.handleCreateCartItem)
@@ -130,17 +140,18 @@ type productResponse struct {
 }
 
 type productDTO struct {
-	ID          string  `json:"id"`
-	Name        string  `json:"name"`
-	Slug        string  `json:"slug"`
-	Description string  `json:"description"`
-	PriceCents  int32   `json:"price_cents"`
-	Currency    string  `json:"currency"`
-	Stock       int32   `json:"stock"`
-	IsActive    bool    `json:"is_active"`
-	SKU         string  `json:"sku"`
-	WeightGrams *int32  `json:"weight_grams,omitempty"`
-	ImageURL    *string `json:"image_url,omitempty"`
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Slug        string   `json:"slug"`
+	Description string   `json:"description"`
+	PriceCents  int32    `json:"price_cents"`
+	Currency    string   `json:"currency"`
+	Stock       int32    `json:"stock"`
+	IsActive    bool     `json:"is_active"`
+	SKU         string   `json:"sku"`
+	WeightGrams *int32   `json:"weight_grams,omitempty"`
+	ImageURL    *string  `json:"image_url,omitempty"`
+	Categories  []string `json:"categories,omitempty"`
 }
 
 type createCartItemRequest struct {
@@ -197,6 +208,63 @@ type checkoutSessionResponse struct {
 	} `json:"data"`
 }
 
+type ordersResponse struct {
+	Data   []orderDTO `json:"data"`
+	Limit  int        `json:"limit"`
+	Offset int        `json:"offset"`
+}
+
+type orderDTO struct {
+	ID            string    `json:"id"`
+	UserID        string    `json:"user_id"`
+	Status        string    `json:"status"`
+	Currency      string    `json:"currency"`
+	SubtotalCents int32     `json:"subtotal_cents"`
+	TotalCents    int32     `json:"total_cents"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
+
+type orderDetailResponse struct {
+	Data orderDetailDTO `json:"data"`
+}
+
+type orderDetailDTO struct {
+	Order orderDTO       `json:"order"`
+	Items []orderItemDTO `json:"items"`
+}
+
+type orderItemDTO struct {
+	ID                 string    `json:"id"`
+	OrderID            string    `json:"order_id"`
+	ProductID          string    `json:"product_id"`
+	ProductName        string    `json:"product_name"`
+	PriceCentsSnapshot int32     `json:"price_cents_snapshot"`
+	Quantity           int32     `json:"quantity"`
+	CreatedAt          time.Time `json:"created_at"`
+}
+
+type googleOAuthConfig struct {
+	ClientID      string
+	ClientSecret  string
+	RedirectURL   string
+	PostLoginPath string
+	AuthURL       string
+	TokenURL      string
+	UserinfoURL   string
+}
+
+type googleTokenResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+}
+
+type googleUserinfoResponse struct {
+	Email         string `json:"email"`
+	EmailVerified bool   `json:"email_verified"`
+	Name          string `json:"name"`
+}
+
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -219,7 +287,12 @@ func (s *Server) handleListProducts(w http.ResponseWriter, r *http.Request) {
 
 	response := productsResponse{Data: make([]productDTO, 0, len(products)), Limit: limit, Offset: offset}
 	for _, p := range products {
-		response.Data = append(response.Data, mapProduct(p))
+		categories, categoryErr := s.products.ListCategoriesByProductID(r.Context(), p.ID)
+		if categoryErr != nil {
+			writeError(w, http.StatusInternalServerError, "failed to list product categories")
+			return
+		}
+		response.Data = append(response.Data, mapProduct(p, categories))
 	}
 
 	writeJSON(w, http.StatusOK, response)
@@ -242,7 +315,13 @@ func (s *Server) handleGetProductBySlug(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	writeJSON(w, http.StatusOK, productResponse{Data: mapProduct(product)})
+	categories, err := s.products.ListCategoriesByProductID(r.Context(), product.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list product categories")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, productResponse{Data: mapProduct(product, categories)})
 }
 
 func (s *Server) handleCreateCartItem(w http.ResponseWriter, r *http.Request) {
@@ -598,6 +677,205 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"success": true})
 }
 
+func readGoogleOAuthConfig() (googleOAuthConfig, bool) {
+	cfg := googleOAuthConfig{
+		ClientID:      strings.TrimSpace(os.Getenv("GOOGLE_OAUTH_CLIENT_ID")),
+		ClientSecret:  strings.TrimSpace(os.Getenv("GOOGLE_OAUTH_CLIENT_SECRET")),
+		RedirectURL:   strings.TrimSpace(os.Getenv("GOOGLE_OAUTH_REDIRECT_URL")),
+		PostLoginPath: strings.TrimSpace(os.Getenv("GOOGLE_OAUTH_POST_LOGIN_URL")),
+		AuthURL:       strings.TrimSpace(os.Getenv("GOOGLE_OAUTH_AUTH_URL")),
+		TokenURL:      strings.TrimSpace(os.Getenv("GOOGLE_OAUTH_TOKEN_URL")),
+		UserinfoURL:   strings.TrimSpace(os.Getenv("GOOGLE_OAUTH_USERINFO_URL")),
+	}
+	if cfg.PostLoginPath == "" {
+		cfg.PostLoginPath = "/catalog"
+	}
+	if cfg.AuthURL == "" {
+		cfg.AuthURL = "https://accounts.google.com/o/oauth2/v2/auth"
+	}
+	if cfg.TokenURL == "" {
+		cfg.TokenURL = "https://oauth2.googleapis.com/token"
+	}
+	if cfg.UserinfoURL == "" {
+		cfg.UserinfoURL = "https://openidconnect.googleapis.com/v1/userinfo"
+	}
+	if cfg.ClientID == "" || cfg.ClientSecret == "" || cfg.RedirectURL == "" {
+		return cfg, false
+	}
+	return cfg, true
+}
+
+func (s *Server) handleGoogleAuthStart(w http.ResponseWriter, r *http.Request) {
+	if s.jwt == nil {
+		writeError(w, http.StatusServiceUnavailable, "jwt auth is not configured")
+		return
+	}
+	cfg, ok := readGoogleOAuthConfig()
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "google oauth is not configured")
+		return
+	}
+
+	state, err := GenerateRefreshToken()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to initialize google oauth")
+		return
+	}
+	setCookieWithTTL(w, googleOAuthStateCookieName, state, 10*time.Minute)
+
+	authURL, err := url.Parse(cfg.AuthURL)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "invalid google oauth auth url")
+		return
+	}
+	query := authURL.Query()
+	query.Set("client_id", cfg.ClientID)
+	query.Set("redirect_uri", cfg.RedirectURL)
+	query.Set("response_type", "code")
+	query.Set("scope", "openid email profile")
+	query.Set("state", state)
+	query.Set("access_type", "online")
+	query.Set("prompt", "select_account")
+	authURL.RawQuery = query.Encode()
+
+	http.Redirect(w, r, authURL.String(), http.StatusFound)
+}
+
+func (s *Server) handleGoogleAuthCallback(w http.ResponseWriter, r *http.Request) {
+	if s.jwt == nil {
+		writeError(w, http.StatusServiceUnavailable, "jwt auth is not configured")
+		return
+	}
+	cfg, ok := readGoogleOAuthConfig()
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "google oauth is not configured")
+		return
+	}
+
+	code := strings.TrimSpace(r.URL.Query().Get("code"))
+	state := strings.TrimSpace(r.URL.Query().Get("state"))
+	if code == "" || state == "" {
+		http.Redirect(w, r, "/auth?error=google_oauth", http.StatusFound)
+		return
+	}
+
+	stateCookie, err := ReadCookie(r, googleOAuthStateCookieName)
+	if err != nil || stateCookie != state {
+		setCookieWithTTL(w, googleOAuthStateCookieName, "", -1*time.Second)
+		http.Redirect(w, r, "/auth?error=google_state", http.StatusFound)
+		return
+	}
+	setCookieWithTTL(w, googleOAuthStateCookieName, "", -1*time.Second)
+
+	tokenReqBody := url.Values{}
+	tokenReqBody.Set("code", code)
+	tokenReqBody.Set("client_id", cfg.ClientID)
+	tokenReqBody.Set("client_secret", cfg.ClientSecret)
+	tokenReqBody.Set("redirect_uri", cfg.RedirectURL)
+	tokenReqBody.Set("grant_type", "authorization_code")
+
+	tokenReq, err := http.NewRequestWithContext(
+		r.Context(),
+		http.MethodPost,
+		cfg.TokenURL,
+		strings.NewReader(tokenReqBody.Encode()),
+	)
+	if err != nil {
+		http.Redirect(w, r, "/auth?error=google_token_request", http.StatusFound)
+		return
+	}
+	tokenReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	tokenReq.Header.Set("Accept", "application/json")
+
+	tokenResp, err := s.http.Do(tokenReq)
+	if err != nil {
+		http.Redirect(w, r, "/auth?error=google_token_exchange", http.StatusFound)
+		return
+	}
+	defer tokenResp.Body.Close()
+	if tokenResp.StatusCode != http.StatusOK {
+		http.Redirect(w, r, "/auth?error=google_token_exchange", http.StatusFound)
+		return
+	}
+
+	var tokenPayload googleTokenResponse
+	if err := json.NewDecoder(tokenResp.Body).Decode(&tokenPayload); err != nil {
+		http.Redirect(w, r, "/auth?error=google_token_response", http.StatusFound)
+		return
+	}
+	if strings.TrimSpace(tokenPayload.AccessToken) == "" {
+		http.Redirect(w, r, "/auth?error=google_access_token", http.StatusFound)
+		return
+	}
+
+	userinfoReq, err := http.NewRequestWithContext(r.Context(), http.MethodGet, cfg.UserinfoURL, nil)
+	if err != nil {
+		http.Redirect(w, r, "/auth?error=google_userinfo_request", http.StatusFound)
+		return
+	}
+	userinfoReq.Header.Set("Authorization", "Bearer "+tokenPayload.AccessToken)
+	userinfoReq.Header.Set("Accept", "application/json")
+
+	userinfoResp, err := s.http.Do(userinfoReq)
+	if err != nil {
+		http.Redirect(w, r, "/auth?error=google_userinfo", http.StatusFound)
+		return
+	}
+	defer userinfoResp.Body.Close()
+	if userinfoResp.StatusCode != http.StatusOK {
+		http.Redirect(w, r, "/auth?error=google_userinfo", http.StatusFound)
+		return
+	}
+
+	var userinfo googleUserinfoResponse
+	if err := json.NewDecoder(userinfoResp.Body).Decode(&userinfo); err != nil {
+		http.Redirect(w, r, "/auth?error=google_userinfo_parse", http.StatusFound)
+		return
+	}
+	email := strings.TrimSpace(userinfo.Email)
+	if email == "" {
+		http.Redirect(w, r, "/auth?error=google_email_missing", http.StatusFound)
+		return
+	}
+
+	user, err := s.products.GetUserByEmail(r.Context(), email)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			http.Redirect(w, r, "/auth?error=user_lookup", http.StatusFound)
+			return
+		}
+
+		fullName := strings.TrimSpace(userinfo.Name)
+		if fullName == "" {
+			fullName = strings.Split(email, "@")[0]
+		}
+		user, err = s.products.CreateUser(r.Context(), db.CreateUserParams{
+			Email:        email,
+			PasswordHash: sql.NullString{},
+			Phone:        sql.NullString{},
+			FullName:     fullName,
+			Role:         "user",
+		})
+		if err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+				user, err = s.products.GetUserByEmail(r.Context(), email)
+			}
+			if err != nil {
+				http.Redirect(w, r, "/auth?error=user_create", http.StatusFound)
+				return
+			}
+		}
+	}
+
+	if err := s.issueAuthSession(r.Context(), w, user.ID); err != nil {
+		http.Redirect(w, r, "/auth?error=session_issue", http.StatusFound)
+		return
+	}
+
+	http.Redirect(w, r, cfg.PostLoginPath, http.StatusFound)
+}
+
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if rawToken, err := ReadRefreshCookie(r); err == nil {
 		if tokenHash, hashErr := HashRefreshToken(rawToken); hashErr == nil {
@@ -736,6 +1014,88 @@ func (s *Server) handleCreateCheckoutSession(w http.ResponseWriter, r *http.Requ
 	var response checkoutSessionResponse
 	response.Data.SessionID = session.ID
 	response.Data.URL = session.URL
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *Server) handleListOrdersByUser(w http.ResponseWriter, r *http.Request) {
+	limit, offset, err := parsePagination(r)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	userID, ok := AuthUserIDFromContext(r.Context())
+	if !ok || userID == uuid.Nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	orders, err := s.products.ListOrdersByUserID(r.Context(), db.ListOrdersByUserIDParams{
+		UserID: userID,
+		Limit:  int32(limit),
+		Offset: int32(offset),
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list orders")
+		return
+	}
+
+	response := ordersResponse{
+		Data:   make([]orderDTO, 0, len(orders)),
+		Limit:  limit,
+		Offset: offset,
+	}
+	for _, order := range orders {
+		response.Data = append(response.Data, mapOrder(order))
+	}
+
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *Server) handleGetOrderByID(w http.ResponseWriter, r *http.Request) {
+	userID, ok := AuthUserIDFromContext(r.Context())
+	if !ok || userID == uuid.Nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	orderIDRaw := chi.URLParam(r, "id")
+	orderID, err := uuid.Parse(orderIDRaw)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid order id")
+		return
+	}
+
+	order, err := s.products.GetOrderByID(r.Context(), orderID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "order not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to get order")
+		return
+	}
+	if order.UserID != userID {
+		writeError(w, http.StatusNotFound, "order not found")
+		return
+	}
+
+	items, err := s.products.ListOrderItemsByOrderID(r.Context(), orderID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list order items")
+		return
+	}
+
+	response := orderDetailResponse{
+		Data: orderDetailDTO{
+			Order: mapOrder(order),
+			Items: make([]orderItemDTO, 0, len(items)),
+		},
+	}
+	for _, item := range items {
+		response.Data.Items = append(response.Data.Items, mapOrderItem(item))
+	}
+
 	writeJSON(w, http.StatusOK, response)
 }
 
@@ -1030,7 +1390,7 @@ func (s *stripeClient) ParseWebhook(payload []byte, signatureHeader, secret stri
 	return event, nil
 }
 
-func mapProduct(p db.Product) productDTO {
+func mapProduct(p db.Product, categories []db.Category) productDTO {
 	var weight *int32
 	if p.WeightGrams.Valid {
 		value := p.WeightGrams.Int32
@@ -1041,6 +1401,11 @@ func mapProduct(p db.Product) productDTO {
 	if p.ImageUrl.Valid {
 		value := p.ImageUrl.String
 		imageURL = &value
+	}
+
+	categoryNames := make([]string, 0, len(categories))
+	for _, category := range categories {
+		categoryNames = append(categoryNames, category.Name)
 	}
 
 	return productDTO{
@@ -1055,6 +1420,32 @@ func mapProduct(p db.Product) productDTO {
 		SKU:         p.Sku,
 		WeightGrams: weight,
 		ImageURL:    imageURL,
+		Categories:  categoryNames,
+	}
+}
+
+func mapOrder(order db.Order) orderDTO {
+	return orderDTO{
+		ID:            order.ID.String(),
+		UserID:        order.UserID.String(),
+		Status:        order.Status,
+		Currency:      order.Currency,
+		SubtotalCents: order.SubtotalCents,
+		TotalCents:    order.TotalCents,
+		CreatedAt:     order.CreatedAt,
+		UpdatedAt:     order.UpdatedAt,
+	}
+}
+
+func mapOrderItem(item db.OrderItem) orderItemDTO {
+	return orderItemDTO{
+		ID:                 item.ID.String(),
+		OrderID:            item.OrderID.String(),
+		ProductID:          item.ProductID.String(),
+		ProductName:        item.ProductNameSnapshot,
+		PriceCentsSnapshot: item.PriceCentsSnapshot,
+		Quantity:           item.Quantity,
+		CreatedAt:          item.CreatedAt,
 	}
 }
 

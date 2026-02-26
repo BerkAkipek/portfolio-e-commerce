@@ -20,12 +20,13 @@ import (
 )
 
 type fakeProductQuerier struct {
-	products []db.Product
-	err      error
-	lastArg  db.ListActiveProductsParams
-	product  db.Product
-	getErr   error
-	lastSlug string
+	products          []db.Product
+	err               error
+	lastArg           db.ListActiveProductsParams
+	product           db.Product
+	getErr            error
+	lastSlug          string
+	productCategories map[uuid.UUID][]db.Category
 
 	cart                 db.Cart
 	cartErr              error
@@ -46,7 +47,13 @@ type fakeProductQuerier struct {
 	listItems            []db.CartItem
 	listErr              error
 	order                db.Order
+	orders               []db.Order
 	orderErr             error
+	ordersErr            error
+	orderByID            db.Order
+	orderByIDErr         error
+	orderItems           []db.OrderItem
+	orderItemsErr        error
 	orderItem            db.OrderItem
 	orderItemErr         error
 	payment              db.Payment
@@ -90,6 +97,9 @@ type fakeProductQuerier struct {
 	lastRemoveID                  uuid.UUID
 	lastListCartID                uuid.UUID
 	lastCreateOrderArg            db.CreateOrderParams
+	lastListOrdersArg             db.ListOrdersByUserIDParams
+	lastGetOrderID                uuid.UUID
+	lastListOrderItemsOrderID     uuid.UUID
 	lastCreateOrderItemArg        db.CreateOrderItemParams
 	lastCreatePaymentArg          db.CreatePaymentParams
 	lastPaymentLookupSessionID    string
@@ -110,6 +120,13 @@ func (f *fakeProductQuerier) GetProductBySlug(_ context.Context, slug string) (d
 		return db.Product{}, f.getErr
 	}
 	return f.product, nil
+}
+
+func (f *fakeProductQuerier) ListCategoriesByProductID(_ context.Context, productID uuid.UUID) ([]db.Category, error) {
+	if f.productCategories == nil {
+		return []db.Category{}, nil
+	}
+	return f.productCategories[productID], nil
 }
 
 func (f *fakeProductQuerier) GetCartByID(_ context.Context, id uuid.UUID) (db.Cart, error) {
@@ -325,6 +342,33 @@ func (f *fakeProductQuerier) CreateOrder(_ context.Context, arg db.CreateOrderPa
 		return db.Order{}, f.orderErr
 	}
 	return f.order, nil
+}
+
+func (f *fakeProductQuerier) ListOrdersByUserID(_ context.Context, arg db.ListOrdersByUserIDParams) ([]db.Order, error) {
+	f.lastListOrdersArg = arg
+	if f.ordersErr != nil {
+		return nil, f.ordersErr
+	}
+	return f.orders, nil
+}
+
+func (f *fakeProductQuerier) GetOrderByID(_ context.Context, id uuid.UUID) (db.Order, error) {
+	f.lastGetOrderID = id
+	if f.orderByIDErr != nil {
+		return db.Order{}, f.orderByIDErr
+	}
+	if f.orderByID.ID != uuid.Nil {
+		return f.orderByID, nil
+	}
+	return db.Order{}, sql.ErrNoRows
+}
+
+func (f *fakeProductQuerier) ListOrderItemsByOrderID(_ context.Context, orderID uuid.UUID) ([]db.OrderItem, error) {
+	f.lastListOrderItemsOrderID = orderID
+	if f.orderItemsErr != nil {
+		return nil, f.orderItemsErr
+	}
+	return f.orderItems, nil
 }
 
 func (f *fakeProductQuerier) CreateOrderItem(_ context.Context, arg db.CreateOrderItemParams) (db.OrderItem, error) {
@@ -1528,6 +1572,139 @@ func TestCreateCheckoutSessionResolveCartError(t *testing.T) {
 
 	if rr.Code != http.StatusInternalServerError {
 		t.Fatalf("expected status 500, got %d", rr.Code)
+	}
+}
+
+func TestListOrdersByUserSuccess(t *testing.T) {
+	t.Setenv("JWT_SECRET", "resolve-secret")
+	userID := uuid.MustParse("00000000-0000-0000-0000-000000000201")
+	store := &fakeProductQuerier{
+		orders: []db.Order{
+			{
+				ID:            uuid.MustParse("00000000-0000-0000-0000-000000000202"),
+				UserID:        userID,
+				Status:        "paid",
+				Currency:      "USD",
+				SubtotalCents: 1999,
+				TotalCents:    1999,
+				CreatedAt:     time.Now().UTC(),
+				UpdatedAt:     time.Now().UTC(),
+			},
+		},
+	}
+	server := NewServer(store)
+	token, err := server.jwt.CreateToken(userID)
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/orders?limit=20&offset=0", nil)
+	req.AddCookie(&http.Cookie{Name: authCookieName, Value: token})
+	rr := httptest.NewRecorder()
+	server.Router().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rr.Code)
+	}
+	if store.lastListOrdersArg.UserID != userID {
+		t.Fatalf("expected user id %s, got %s", userID, store.lastListOrdersArg.UserID)
+	}
+	if store.lastListOrdersArg.Limit != 20 || store.lastListOrdersArg.Offset != 0 {
+		t.Fatalf("unexpected pagination: %+v", store.lastListOrdersArg)
+	}
+}
+
+func TestListOrdersByUserUnauthorized(t *testing.T) {
+	t.Setenv("JWT_SECRET", "resolve-secret")
+	req := httptest.NewRequest(http.MethodGet, "/orders", nil)
+	rr := httptest.NewRecorder()
+
+	NewServer(&fakeProductQuerier{}).Router().ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected status 401, got %d", rr.Code)
+	}
+}
+
+func TestGetOrderByIDSuccess(t *testing.T) {
+	t.Setenv("JWT_SECRET", "resolve-secret")
+	userID := uuid.MustParse("00000000-0000-0000-0000-000000000301")
+	orderID := uuid.MustParse("00000000-0000-0000-0000-000000000302")
+	productID := uuid.MustParse("00000000-0000-0000-0000-000000000303")
+	store := &fakeProductQuerier{
+		orderByID: db.Order{
+			ID:            orderID,
+			UserID:        userID,
+			Status:        "paid",
+			Currency:      "USD",
+			SubtotalCents: 3000,
+			TotalCents:    3300,
+			CreatedAt:     time.Now().UTC(),
+			UpdatedAt:     time.Now().UTC(),
+		},
+		orderItems: []db.OrderItem{
+			{
+				ID:                  uuid.MustParse("00000000-0000-0000-0000-000000000304"),
+				OrderID:             orderID,
+				ProductID:           productID,
+				ProductNameSnapshot: "Pro Tee",
+				PriceCentsSnapshot:  1500,
+				Quantity:            2,
+				CreatedAt:           time.Now().UTC(),
+			},
+		},
+	}
+	server := NewServer(store)
+	token, err := server.jwt.CreateToken(userID)
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/orders/"+orderID.String(), nil)
+	req.AddCookie(&http.Cookie{Name: authCookieName, Value: token})
+	rr := httptest.NewRecorder()
+	server.Router().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rr.Code)
+	}
+	if store.lastGetOrderID != orderID {
+		t.Fatalf("expected get order id %s, got %s", orderID, store.lastGetOrderID)
+	}
+	if store.lastListOrderItemsOrderID != orderID {
+		t.Fatalf("expected list order items id %s, got %s", orderID, store.lastListOrderItemsOrderID)
+	}
+}
+
+func TestGetOrderByIDOwnershipDenied(t *testing.T) {
+	t.Setenv("JWT_SECRET", "resolve-secret")
+	authUserID := uuid.MustParse("00000000-0000-0000-0000-000000000311")
+	ownerUserID := uuid.MustParse("00000000-0000-0000-0000-000000000312")
+	orderID := uuid.MustParse("00000000-0000-0000-0000-000000000313")
+	store := &fakeProductQuerier{
+		orderByID: db.Order{
+			ID:            orderID,
+			UserID:        ownerUserID,
+			Status:        "paid",
+			Currency:      "USD",
+			SubtotalCents: 3000,
+			TotalCents:    3300,
+			CreatedAt:     time.Now().UTC(),
+			UpdatedAt:     time.Now().UTC(),
+		},
+	}
+	server := NewServer(store)
+	token, err := server.jwt.CreateToken(authUserID)
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/orders/"+orderID.String(), nil)
+	req.AddCookie(&http.Cookie{Name: authCookieName, Value: token})
+	rr := httptest.NewRecorder()
+	server.Router().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("expected status 404, got %d", rr.Code)
 	}
 }
 

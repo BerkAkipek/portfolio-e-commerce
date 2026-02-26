@@ -72,6 +72,25 @@ describe("CartClient", () => {
     expect(screen.getByText("$37.00")).toBeInTheDocument();
   });
 
+  it("clears stale guest cart id when cart is not found", async () => {
+    window.localStorage.setItem(GUEST_CART_STORAGE_KEY, "missing-cart");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 404,
+      }),
+    );
+
+    renderCart();
+
+    expect(
+      await screen.findByText("Your previous cart was no longer available. Start a new cart."),
+    ).toBeInTheDocument();
+    expect(window.localStorage.getItem(GUEST_CART_STORAGE_KEY)).toBeNull();
+    expect(screen.getByText("Your cart is empty")).toBeInTheDocument();
+  });
+
   it("updates quantity and shows confirmation message", async () => {
     window.localStorage.setItem(GUEST_CART_STORAGE_KEY, "cart-2");
     const fetchSpy = vi.fn().mockImplementation((input: string | URL, init?: RequestInit) => {
@@ -122,6 +141,72 @@ describe("CartClient", () => {
         (init as RequestInit | undefined)?.method === "PATCH",
     );
     expect(patchCall).toBeTruthy();
+  });
+
+  it("prevents duplicate quantity update requests while a mutation is pending", async () => {
+    window.localStorage.setItem(GUEST_CART_STORAGE_KEY, "cart-4");
+
+    let resolvePatch: (() => void) | null = null;
+    const patchPromise = new Promise<void>((resolve) => {
+      resolvePatch = resolve;
+    });
+
+    const fetchSpy = vi.fn().mockImplementation((input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/api/cart/cart-4/items")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: [
+              {
+                id: "item-4",
+                cart_id: "cart-4",
+                product_id: "prod-4",
+                quantity: 1,
+                price_cents_snapshot: 1000,
+                created_at: "2026-01-01T00:00:00Z",
+              },
+            ],
+          }),
+        });
+      }
+      if (url.includes("/api/cart/items/item-4") && init?.method === "PATCH") {
+        return patchPromise.then(() => ({
+          ok: true,
+          status: 200,
+          json: async () => ({ data: {} }),
+        }));
+      }
+      return Promise.resolve({
+        ok: false,
+        status: 500,
+        json: async () => ({ error: "unexpected request" }),
+      });
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const user = userEvent.setup();
+    renderCart();
+    const plusButton = await screen.findByRole("button", { name: "+" });
+
+    await user.click(plusButton);
+    await waitFor(() => {
+      expect(plusButton).toBeDisabled();
+    });
+    await user.click(plusButton);
+
+    const patchCalls = fetchSpy.mock.calls.filter(
+      ([url, init]) =>
+        String(url).includes("/api/cart/items/item-4") &&
+        (init as RequestInit | undefined)?.method === "PATCH",
+    );
+    expect(patchCalls).toHaveLength(1);
+
+    if (resolvePatch) {
+      resolvePatch();
+    }
+    await screen.findByText("Cart updated.");
   });
 
   it("removes item and shows confirmation message", async () => {
@@ -180,6 +265,59 @@ describe("CartClient", () => {
     await screen.findByText("Item removed.");
     await waitFor(() => {
       expect(screen.getByText("Your cart is empty")).toBeInTheDocument();
+    });
+  });
+
+  it("starts checkout and calls checkout session endpoint", async () => {
+    window.localStorage.setItem(GUEST_CART_STORAGE_KEY, "cart-5");
+    const fetchSpy = vi.fn().mockImplementation((input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/api/cart/cart-5/items")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: [
+              {
+                id: "item-5",
+                cart_id: "cart-5",
+                product_id: "prod-5",
+                quantity: 1,
+                price_cents_snapshot: 2000,
+                created_at: "2026-01-01T00:00:00Z",
+              },
+            ],
+          }),
+        });
+      }
+      if (url === "/api/checkout/session" && init?.method === "POST") {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: { session_id: "cs_1", url: "https://checkout.stripe.com/c/pay/cs_1" },
+          }),
+        });
+      }
+      return Promise.resolve({
+        ok: false,
+        status: 500,
+        json: async () => ({ error: "unexpected request" }),
+      });
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+    const user = userEvent.setup();
+    renderCart();
+    await screen.findByText("prod-5");
+
+    await user.click(screen.getByRole("button", { name: "Proceed to checkout" }));
+    await waitFor(() => {
+      expect(fetchSpy).toHaveBeenCalledWith(
+        "/api/checkout/session",
+        expect.objectContaining({
+          method: "POST",
+        }),
+      );
     });
   });
 });

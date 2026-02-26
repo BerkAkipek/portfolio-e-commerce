@@ -61,6 +61,10 @@ services:
       PORT: "8080"
       JWT_SECRET: dev-local-jwt-secret
       APP_ENV: development
+      GOOGLE_OAUTH_REDIRECT_URL: http://localhost:3000/api/auth/google/callback
+      GOOGLE_OAUTH_POST_LOGIN_URL: /catalog
+      CHECKOUT_SUCCESS_URL: http://localhost:3000/checkout/success
+      CHECKOUT_CANCEL_URL: http://localhost:3000/checkout/cancel
     ports:
       - "8080:8080"
 

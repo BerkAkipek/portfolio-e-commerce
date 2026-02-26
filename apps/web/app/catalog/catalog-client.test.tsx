@@ -168,4 +168,42 @@ describe("CatalogClient", () => {
     expect(screen.getByText("Page 2 of 2")).toBeInTheDocument();
     expect(screen.getByText("Catalog Product 9")).toBeInTheDocument();
   });
+
+  it("loads additional product pages beyond the first 100 results", async () => {
+    const products = Array.from({ length: 120 }).map((_, index) => ({
+      id: `bulk-${index + 1}`,
+      name: `Bulk Product ${index + 1}`,
+      slug: `bulk-product-${index + 1}`,
+      description: "Bulk catalog item",
+      price_cents: 1000 + index,
+      currency: "USD",
+      stock: 100,
+      categories: ["Accessories"],
+    }));
+
+    const fetchSpy = vi.fn().mockImplementation((input: string | URL) => {
+      const url = new URL(String(input), "http://localhost");
+      const limit = Number.parseInt(url.searchParams.get("limit") ?? "100", 10);
+      const offset = Number.parseInt(url.searchParams.get("offset") ?? "0", 10);
+      const page = products.slice(offset, offset + limit);
+      return Promise.resolve({
+        ok: true,
+        json: async () => ({
+          data: page,
+          limit,
+          offset,
+        }),
+      });
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const user = userEvent.setup();
+    renderCatalog();
+
+    await screen.findByText("Bulk Product 1");
+    await user.type(screen.getByPlaceholderText("Search by product or category..."), "Bulk Product 120");
+
+    expect(await screen.findByText("Bulk Product 120")).toBeInTheDocument();
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
 });

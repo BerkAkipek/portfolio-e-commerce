@@ -2,7 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { GUEST_CART_STORAGE_KEY } from "@/lib/cart";
 
@@ -18,6 +18,14 @@ type CartItem = {
 type CartItemsResponse = {
   data: CartItem[];
   notFound?: boolean;
+};
+
+type CheckoutSessionResponse = {
+  data?: {
+    session_id: string;
+    url: string;
+  };
+  error?: string;
 };
 
 function formatPrice(priceCents: number): string {
@@ -67,6 +75,28 @@ async function removeCartItem(itemID: string) {
   }
 }
 
+async function createCheckoutSession() {
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
+  const response = await fetch("/api/checkout/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      success_url: `${origin}/checkout/success`,
+      cancel_url: `${origin}/checkout/cancel`,
+    }),
+  });
+
+  const payload = (await response.json()) as CheckoutSessionResponse;
+  if (!response.ok) {
+    throw new Error(payload.error || "failed to start checkout");
+  }
+  const checkoutURL = payload.data?.url;
+  if (!checkoutURL) {
+    throw new Error("missing checkout URL");
+  }
+  return checkoutURL;
+}
+
 export default function CartClient() {
   const queryClient = useQueryClient();
 
@@ -83,6 +113,15 @@ export default function CartClient() {
     queryFn: () => fetchCartItems(cartID),
     enabled: cartID !== "",
   });
+
+  useEffect(() => {
+    if (!query.data?.notFound) {
+      return;
+    }
+    if (typeof window !== "undefined") {
+      window.localStorage.removeItem(GUEST_CART_STORAGE_KEY);
+    }
+  }, [query.data?.notFound]);
 
   const subtotal = useMemo(() => {
     return (query.data?.data ?? []).reduce((sum, item) => {
@@ -113,8 +152,27 @@ export default function CartClient() {
     },
   });
 
+  const checkoutMutation = useMutation({
+    mutationFn: createCheckoutSession,
+    onSuccess: (checkoutURL) => {
+      window.location.assign(checkoutURL);
+    },
+    onError: (error) => {
+      const text = error instanceof Error ? error.message : "Unable to start checkout.";
+      if (text.toLowerCase().includes("unauthorized")) {
+        setMessage("Please login to continue to checkout.");
+        return;
+      }
+      setMessage(text);
+    },
+  });
+
   const items = query.data?.data ?? [];
   const hasItems = items.length > 0;
+  const isMutating = updateMutation.isPending || removeMutation.isPending;
+  const userMessage = query.data?.notFound
+    ? "Your previous cart was no longer available. Start a new cart."
+    : message;
 
   return (
     <main className="relative mx-auto w-full max-w-6xl px-6 pb-14 pt-8 sm:px-10 lg:px-12">
@@ -132,7 +190,7 @@ export default function CartClient() {
         Sign in to save your cart across devices and sessions.
       </div>
 
-      {message ? <p className="mb-4 text-sm text-slate-200">{message}</p> : null}
+      {userMessage ? <p className="mb-4 text-sm text-slate-200">{userMessage}</p> : null}
 
       {!cartID || (!query.isLoading && !hasItems) ? (
         <section className="rounded-3xl border border-white/12 bg-white/5 p-8 text-center">
@@ -184,13 +242,16 @@ export default function CartClient() {
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
+                      disabled={isMutating}
                       onClick={() =>
-                        updateMutation.mutate({
-                          itemID: item.id,
-                          quantity: Math.max(1, item.quantity - 1),
-                        })
+                        isMutating
+                          ? undefined
+                          : updateMutation.mutate({
+                              itemID: item.id,
+                              quantity: Math.max(1, item.quantity - 1),
+                            })
                       }
-                      className="h-9 w-9 rounded-full border border-white/20 text-slate-100 transition hover:border-cyan-300/80"
+                      className="h-9 w-9 rounded-full border border-white/20 text-slate-100 transition hover:border-cyan-300/80 disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       -
                     </button>
@@ -199,20 +260,24 @@ export default function CartClient() {
                     </span>
                     <button
                       type="button"
+                      disabled={isMutating}
                       onClick={() =>
-                        updateMutation.mutate({
-                          itemID: item.id,
-                          quantity: item.quantity + 1,
-                        })
+                        isMutating
+                          ? undefined
+                          : updateMutation.mutate({
+                              itemID: item.id,
+                              quantity: item.quantity + 1,
+                            })
                       }
-                      className="h-9 w-9 rounded-full border border-white/20 text-slate-100 transition hover:border-cyan-300/80"
+                      className="h-9 w-9 rounded-full border border-white/20 text-slate-100 transition hover:border-cyan-300/80 disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       +
                     </button>
                     <button
                       type="button"
-                      onClick={() => removeMutation.mutate(item.id)}
-                      className="ml-2 rounded-full border border-white/20 px-3 py-1.5 text-xs text-slate-200 transition hover:border-red-300/80 hover:text-red-100"
+                      disabled={isMutating}
+                      onClick={() => (isMutating ? undefined : removeMutation.mutate(item.id))}
+                      className="ml-2 rounded-full border border-white/20 px-3 py-1.5 text-xs text-slate-200 transition hover:border-red-300/80 hover:text-red-100 disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       Remove
                     </button>
@@ -228,9 +293,11 @@ export default function CartClient() {
             <p className="mt-2 text-xs text-slate-400">Taxes and shipping calculated at checkout.</p>
             <button
               type="button"
+              disabled={checkoutMutation.isPending}
+              onClick={() => checkoutMutation.mutate()}
               className="mt-5 w-full rounded-full bg-cyan-300 px-5 py-3 text-sm font-semibold tracking-wide text-[#03151b] transition hover:bg-cyan-200"
             >
-              Proceed to checkout
+              {checkoutMutation.isPending ? "Redirecting..." : "Proceed to checkout"}
             </button>
           </aside>
         </section>

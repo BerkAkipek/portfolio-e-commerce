@@ -5,18 +5,22 @@ function getApiBaseURL(): string {
   return base && base.length > 0 ? base : "http://localhost:8080";
 }
 
-export async function GET(
-  _request: NextRequest,
-  context: { params: Promise<{ slug: string }> },
-) {
-  const { slug } = await context.params;
-  const upstreamURL = new URL(`/products/${encodeURIComponent(slug)}`, getApiBaseURL());
+export async function GET(request: NextRequest) {
+  const searchParams = request.nextUrl.searchParams;
+  const limit = searchParams.get("limit") ?? "20";
+  const offset = searchParams.get("offset") ?? "0";
+  const upstreamURL = new URL("/orders", getApiBaseURL());
+  upstreamURL.searchParams.set("limit", limit);
+  upstreamURL.searchParams.set("offset", offset);
 
   try {
     const response = await fetch(upstreamURL, {
       method: "GET",
       cache: "no-store",
-      headers: { Accept: "application/json" },
+      headers: {
+        Accept: "application/json",
+        Cookie: request.headers.get("cookie") ?? "",
+      },
     });
 
     const payload = await response.text();
@@ -25,10 +29,14 @@ export async function GET(
     if (contentType) {
       proxied.headers.set("content-type", contentType);
     }
+    const setCookie = response.headers.get("set-cookie");
+    if (setCookie) {
+      proxied.headers.set("set-cookie", setCookie);
+    }
     return proxied;
   } catch {
     return NextResponse.json(
-      { error: "unable to reach product service" },
+      { error: "unable to reach orders service" },
       { status: 502 },
     );
   }

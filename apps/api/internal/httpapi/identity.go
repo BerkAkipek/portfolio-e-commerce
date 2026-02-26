@@ -21,9 +21,10 @@ import (
 )
 
 const (
-	authCookieName         = "access_token"
-	guestSessionCookieName = "guest_session_id"
-	refreshCookieName      = "refresh_token"
+	authCookieName             = "access_token"
+	guestSessionCookieName     = "guest_session_id"
+	refreshCookieName          = "refresh_token"
+	googleOAuthStateCookieName = "google_oauth_state"
 )
 
 type ActorType string
