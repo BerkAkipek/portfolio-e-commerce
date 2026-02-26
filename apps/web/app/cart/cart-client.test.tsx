@@ -1,0 +1,185 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import { GUEST_CART_STORAGE_KEY } from "@/lib/cart";
+
+import CartClient from "./cart-client";
+
+function renderCart() {
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false },
+      mutations: { retry: false },
+    },
+  });
+
+  return render(
+    <QueryClientProvider client={queryClient}>
+      <CartClient />
+    </QueryClientProvider>,
+  );
+}
+
+describe("CartClient", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    window.localStorage.clear();
+  });
+
+  it("shows empty state and sign-in messaging without stored cart", async () => {
+    renderCart();
+
+    expect(await screen.findByText("Your cart is empty")).toBeInTheDocument();
+    expect(
+      screen.getByText("Sign in to save your cart across devices and sessions."),
+    ).toBeInTheDocument();
+  });
+
+  it("renders items and subtotal from cart API", async () => {
+    window.localStorage.setItem(GUEST_CART_STORAGE_KEY, "cart-1");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          data: [
+            {
+              id: "item-1",
+              cart_id: "cart-1",
+              product_id: "prod-1",
+              quantity: 2,
+              price_cents_snapshot: 1500,
+              created_at: "2026-01-01T00:00:00Z",
+            },
+            {
+              id: "item-2",
+              cart_id: "cart-1",
+              product_id: "prod-2",
+              quantity: 1,
+              price_cents_snapshot: 700,
+              created_at: "2026-01-01T00:00:00Z",
+            },
+          ],
+        }),
+      }),
+    );
+
+    renderCart();
+    expect(await screen.findByText("prod-1")).toBeInTheDocument();
+    expect(screen.getByText("$37.00")).toBeInTheDocument();
+  });
+
+  it("updates quantity and shows confirmation message", async () => {
+    window.localStorage.setItem(GUEST_CART_STORAGE_KEY, "cart-2");
+    const fetchSpy = vi.fn().mockImplementation((input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/api/cart/cart-2/items")) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            data: [
+              {
+                id: "item-9",
+                cart_id: "cart-2",
+                product_id: "prod-9",
+                quantity: 1,
+                price_cents_snapshot: 990,
+                created_at: "2026-01-01T00:00:00Z",
+              },
+            ],
+          }),
+        });
+      }
+      if (url.includes("/api/cart/items/item-9") && init?.method === "PATCH") {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({ data: {} }),
+        });
+      }
+      return Promise.resolve({
+        ok: false,
+        status: 500,
+        json: async () => ({ error: "unexpected request" }),
+      });
+    });
+    vi.stubGlobal("fetch", fetchSpy);
+
+    const user = userEvent.setup();
+    renderCart();
+    await screen.findByText("prod-9");
+
+    await user.click(screen.getByRole("button", { name: "+" }));
+    await screen.findByText("Cart updated.");
+
+    const patchCall = fetchSpy.mock.calls.find(
+      ([url, init]) =>
+        String(url).includes("/api/cart/items/item-9") &&
+        (init as RequestInit | undefined)?.method === "PATCH",
+    );
+    expect(patchCall).toBeTruthy();
+  });
+
+  it("removes item and shows confirmation message", async () => {
+    window.localStorage.setItem(GUEST_CART_STORAGE_KEY, "cart-3");
+    let getCount = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation((input: string | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.includes("/api/cart/cart-3/items")) {
+          getCount += 1;
+          if (getCount === 1) {
+            return Promise.resolve({
+              ok: true,
+              status: 200,
+              json: async () => ({
+                data: [
+                  {
+                    id: "item-3",
+                    cart_id: "cart-3",
+                    product_id: "prod-3",
+                    quantity: 1,
+                    price_cents_snapshot: 2500,
+                    created_at: "2026-01-01T00:00:00Z",
+                  },
+                ],
+              }),
+            });
+          }
+          return Promise.resolve({
+            ok: true,
+            status: 200,
+            json: async () => ({ data: [] }),
+          });
+        }
+        if (url.includes("/api/cart/items/item-3") && init?.method === "DELETE") {
+          return Promise.resolve({
+            ok: true,
+            status: 204,
+            text: async () => "",
+          });
+        }
+        return Promise.resolve({
+          ok: false,
+          status: 500,
+          json: async () => ({ error: "unexpected request" }),
+        });
+      }),
+    );
+
+    const user = userEvent.setup();
+    renderCart();
+    await screen.findByText("prod-3");
+
+    await user.click(screen.getByRole("button", { name: "Remove" }));
+    await screen.findByText("Item removed.");
+    await waitFor(() => {
+      expect(screen.getByText("Your cart is empty")).toBeInTheDocument();
+    });
+  });
+});
