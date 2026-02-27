@@ -5,6 +5,14 @@ export function getApiBaseURL(): string {
   return base && base.length > 0 ? base : "http://localhost:8080";
 }
 
+function getCSRFHeader(request: NextRequest): Record<string, string> {
+  const csrfToken = request.cookies.get("csrf_token")?.value?.trim();
+  if (!csrfToken) {
+    return {};
+  }
+  return { "X-CSRF-Token": csrfToken };
+}
+
 export async function proxyJSONPost(request: NextRequest, path: string) {
   const upstreamURL = new URL(path, getApiBaseURL());
 
@@ -17,6 +25,7 @@ export async function proxyJSONPost(request: NextRequest, path: string) {
         "Content-Type": "application/json",
         Accept: "application/json",
         Cookie: request.headers.get("cookie") ?? "",
+        ...getCSRFHeader(request),
       },
       body: rawBody,
     });

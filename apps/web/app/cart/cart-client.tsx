@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 
 import { GUEST_CART_STORAGE_KEY } from "@/lib/cart";
+import { isLikelyNetworkError } from "@/lib/network";
 
 type CartItem = {
   id: string;
@@ -107,12 +108,30 @@ export default function CartClient() {
     return window.localStorage.getItem(GUEST_CART_STORAGE_KEY) ?? "";
   });
   const [message, setMessage] = useState("");
+  const [isOffline, setIsOffline] = useState(() =>
+    typeof navigator !== "undefined" ? !navigator.onLine : false,
+  );
 
   const query = useQuery({
     queryKey: ["cart-items", cartID],
     queryFn: () => fetchCartItems(cartID),
     enabled: cartID !== "",
+    retry: false,
   });
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const handleOnline = () => setIsOffline(false);
+    const handleOffline = () => setIsOffline(true);
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, []);
 
   useEffect(() => {
     if (!query.data?.notFound) {
@@ -137,6 +156,10 @@ export default function CartClient() {
       await queryClient.invalidateQueries({ queryKey: ["cart-items", cartID] });
     },
     onError: (error) => {
+      if (isLikelyNetworkError(error)) {
+        setMessage("Network unavailable. Reconnect and try again.");
+        return;
+      }
       setMessage(error instanceof Error ? error.message : "Unable to update cart.");
     },
   });
@@ -148,6 +171,10 @@ export default function CartClient() {
       await queryClient.invalidateQueries({ queryKey: ["cart-items", cartID] });
     },
     onError: () => {
+      if (isOffline) {
+        setMessage("You are offline. Reconnect to remove items.");
+        return;
+      }
       setMessage("Unable to remove item.");
     },
   });
@@ -158,6 +185,10 @@ export default function CartClient() {
       window.location.assign(checkoutURL);
     },
     onError: (error) => {
+      if (isLikelyNetworkError(error)) {
+        setMessage("You appear offline. Reconnect to continue checkout.");
+        return;
+      }
       const text = error instanceof Error ? error.message : "Unable to start checkout.";
       if (text.toLowerCase().includes("unauthorized")) {
         setMessage("Please login to continue to checkout.");
@@ -173,6 +204,9 @@ export default function CartClient() {
   const userMessage = query.data?.notFound
     ? "Your previous cart was no longer available. Start a new cart."
     : message;
+  const cartLoadErrorMessage = isOffline || isLikelyNetworkError(query.error)
+    ? "You appear offline. Reconnect to load your cart."
+    : "Failed to load cart items.";
 
   return (
     <main className="relative mx-auto w-full max-w-6xl px-6 pb-14 pt-8 sm:px-10 lg:px-12">
@@ -215,9 +249,16 @@ export default function CartClient() {
       ) : null}
 
       {query.isError ? (
-        <div className="rounded-2xl border border-red-300/30 bg-red-400/10 p-4 text-sm text-red-100">
-          Failed to load cart items.
-        </div>
+        <section className="rounded-2xl border border-red-300/30 bg-red-400/10 p-4 text-sm text-red-100">
+          <p>{cartLoadErrorMessage}</p>
+          <button
+            type="button"
+            onClick={() => query.refetch()}
+            className="mt-3 rounded-full border border-red-200/30 px-3 py-1.5 text-xs font-semibold text-red-100 transition hover:border-red-100/70"
+          >
+            Retry
+          </button>
+        </section>
       ) : null}
 
       {hasItems ? (

@@ -34,19 +34,23 @@ High-level flow:
 
 ## Core Features
 
+- Homepage featured products backed by real product data + add-to-cart actions
 - Product catalog with category-aware data, search/sort/filter/pagination UI
 - Product detail page with image gallery, stock status, and add-to-cart
 - Cart page with quantity updates, remove item, subtotal, empty state, and guest-cart messaging
+- Offline/network-aware UX for cart and auth session refresh with retry actions
 - Authentication (`register`, `login`, `logout`) with cookie-based tokens
 - Google Sign-In via backend OAuth authorization code flow
 - Session restoration UX (silent refresh-token rotation surfaced in UI)
 - Account security hint UI (short-lived access token, silent refresh, logout revocation)
+- Custom web error pages (`error`, `global-error`, `not-found`)
 - Guest + authenticated cart lifecycle and ownership protections
 - Stripe Checkout redirect flow from cart
 - Checkout success + cancel pages
 - Authenticated order history (`/orders`) and order details (`/orders/{id}`)
 - Receipt page for eligible orders (`/orders/{id}/receipt`)
 - Webhook verification + order, order_items, payment creation
+- Rate limiting on sensitive routes (`login`, `register`, refresh, checkout, webhook)
 - Strong database integrity constraints (uniqueness, check constraints, state modeling)
 
 ## Currently Testable Functionality
@@ -99,6 +103,8 @@ High-level flow:
 Available at both root and `/api` prefix:
 
 - `GET /health`
+- `GET /healthz`
+- `GET /readyz`
 - `GET /products?limit=&offset=`
 - `GET /products/{slug}`
 - `POST /auth/register`
@@ -178,6 +184,12 @@ Seed realistic dev catalog data (categories + products + mappings):
 make seed-dev-catalog
 ```
 
+Shortcut:
+
+```bash
+make seed
+```
+
 ### Option 2: Run components locally
 
 API:
@@ -198,7 +210,7 @@ npm run dev
 
 API (`apps/api`):
 - Required: `DATABASE_URL`
-- Optional: `PORT`, `JWT_SECRET`, `COOKIE_SECURE`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `CHECKOUT_SUCCESS_URL`, `CHECKOUT_CANCEL_URL`, `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_OAUTH_REDIRECT_URL`, `GOOGLE_OAUTH_POST_LOGIN_URL`, `GOOGLE_OAUTH_AUTH_URL`, `GOOGLE_OAUTH_TOKEN_URL`, `GOOGLE_OAUTH_USERINFO_URL`
+- Optional: `PORT`, `APP_ENV`, `JWT_SECRET`, `JWT_ISSUER`, `COOKIE_SECURE`, `COOKIE_SAMESITE`, `CSRF_PROTECTION_MODE`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `CHECKOUT_SUCCESS_URL`, `CHECKOUT_CANCEL_URL`, `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_OAUTH_REDIRECT_URL`, `GOOGLE_OAUTH_POST_LOGIN_URL`, `GOOGLE_OAUTH_POST_LOGIN_ALLOWLIST`, `GOOGLE_OAUTH_AUTH_URL`, `GOOGLE_OAUTH_TOKEN_URL`, `GOOGLE_OAUTH_USERINFO_URL`
 
 Web (`apps/web`):
 - `NEXT_PUBLIC_API_URL`
@@ -239,11 +251,41 @@ Latest local validation:
 - `apps/api/internal/httpapi`: tests passing
 - `apps/web`: lint passing, UI tests passing
 
+## Demo Mode
+
+If you want a fast portfolio/demo walkthrough:
+
+1. Start the stack and seed catalog data:
+
+```bash
+make up
+make seed
+```
+
+2. Quick login options:
+- UI path: open `http://localhost:3000/auth` and register a new user.
+- API path (pre-create a demo user):
+
+```bash
+curl -i -X POST http://localhost:3000/api/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"full_name":"Demo Shopper","email":"demo@example.com","password":"DemoPass123!"}'
+```
+
+3. Stripe test checkout:
+- Card number: `4242 4242 4242 4242`
+- Expiry: any future date (e.g. `12/34`)
+- CVC: any 3 digits (e.g. `123`)
+- ZIP/Postal: any valid-looking value
+
 ## Deployment Notes
 
 - API and web use multi-stage Dockerfiles for smaller production images.
 - Schema migrations are idempotent and tracked in `schema_migrations`.
 - Checkout webhook handling is idempotent to prevent duplicate orders/payments.
+- API uses request IDs + structured request logs, server timeouts, request size limits, and graceful shutdown.
+- Cookie auth is `HttpOnly` with configurable `Secure`/`SameSite` policy.
+- CSRF token mode is supported for cross-site cookie scenarios (`CSRF_PROTECTION_MODE=token`).
 
 ## Portfolio Notes
 

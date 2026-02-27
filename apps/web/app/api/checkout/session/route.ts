@@ -7,6 +7,7 @@ function getApiBaseURL(): string {
 
 export async function POST(request: NextRequest) {
   const upstreamURL = new URL("/checkout/session", getApiBaseURL());
+  const csrfToken = request.cookies.get("csrf_token")?.value?.trim();
 
   try {
     const rawBody = await request.text();
@@ -17,6 +18,7 @@ export async function POST(request: NextRequest) {
         "Content-Type": "application/json",
         Accept: "application/json",
         Cookie: request.headers.get("cookie") ?? "",
+        ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
       },
       body: rawBody,
     });

@@ -11,6 +11,7 @@ export async function PATCH(
 ) {
   const { itemId } = await context.params;
   const upstreamURL = new URL(`/cart/items/${encodeURIComponent(itemId)}`, getApiBaseURL());
+  const csrfToken = request.cookies.get("csrf_token")?.value?.trim();
 
   try {
     const rawBody = await request.text();
@@ -21,6 +22,7 @@ export async function PATCH(
         "Content-Type": "application/json",
         Accept: "application/json",
         Cookie: request.headers.get("cookie") ?? "",
+        ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
       },
       body: rawBody,
     });
@@ -55,6 +57,7 @@ export async function DELETE(
 ) {
   const { itemId } = await context.params;
   const upstreamURL = new URL(`/cart/items/${encodeURIComponent(itemId)}`, getApiBaseURL());
+  const csrfToken = request.cookies.get("csrf_token")?.value?.trim();
 
   try {
     const response = await fetch(upstreamURL, {
@@ -63,6 +66,7 @@ export async function DELETE(
       headers: {
         Accept: "application/json",
         Cookie: request.headers.get("cookie") ?? "",
+        ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
       },
     });
 

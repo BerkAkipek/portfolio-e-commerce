@@ -87,4 +87,19 @@ describe("SessionBanner", () => {
     expect(await screen.findByText("Signed out.")).toBeInTheDocument();
     expect(await screen.findByText("Guest session")).toBeInTheDocument();
   });
+
+  it("shows retry guidance when auth session refresh cannot reach network", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockRejectedValue(new TypeError("Failed to fetch")),
+    );
+
+    renderBanner();
+
+    expect(await screen.findByText("Session unavailable")).toBeInTheDocument();
+    expect(
+      screen.getByText("Offline. Cannot refresh authentication state."),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+  });
 });

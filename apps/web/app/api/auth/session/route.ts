@@ -19,6 +19,7 @@ function hasRotatedAuthCookies(setCookieHeader: string | null): boolean {
 
 export async function GET(request: NextRequest) {
   const upstreamURL = new URL("/checkout/session", getApiBaseURL());
+  const csrfToken = request.cookies.get("csrf_token")?.value?.trim();
 
   try {
     const response = await fetch(upstreamURL, {
@@ -28,6 +29,7 @@ export async function GET(request: NextRequest) {
         "Content-Type": "application/json",
         Accept: "application/json",
         Cookie: request.headers.get("cookie") ?? "",
+        ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
       },
       body: JSON.stringify({}),
     });

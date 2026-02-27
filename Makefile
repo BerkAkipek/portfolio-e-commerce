@@ -1,5 +1,5 @@
 .PHONY: dev up build rebuild down stop restart ps logs logs-api logs-web logs-db logs-migrate \
-	seed-products seed-dev-catalog db-shell migrate-status health check-api check-web clean \
+	seed seed-products seed-dev-catalog db-shell migrate-status health check-api check-web clean \
 	api web build-api build-web test-api test-api-verbose test-api-smoke
 
 dev: up
@@ -48,6 +48,8 @@ migrate-status:
 
 seed-products:
 	docker compose exec -T db psql postgresql://postgres:postgres@localhost:5432/ecommerce -c "INSERT INTO products (name, slug, description, price_cents, currency, stock, is_active, sku) VALUES ('Basic Tee','basic-tee','Simple t-shirt',1999,'USD',10,TRUE,'TEE-001') ON CONFLICT DO NOTHING;"
+
+seed: seed-dev-catalog
 
 seed-dev-catalog:
 	cat scripts/seed_dev_catalog.sql | docker compose exec -T db psql postgresql://postgres:postgres@localhost:5432/ecommerce -v ON_ERROR_STOP=1

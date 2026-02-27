@@ -60,18 +60,32 @@ type ProductQuerier interface {
 }
 
 type Server struct {
-	products ProductQuerier
-	carts    *CartService
-	stripe   stripeGateway
-	jwt      *JWTUtility
-	http     *http.Client
+	products        ProductQuerier
+	carts           *CartService
+	stripe          stripeGateway
+	jwt             *JWTUtility
+	http            *http.Client
+	loginLimiter    *fixedWindowLimiter
+	registerLimiter *fixedWindowLimiter
+	refreshLimiter  *fixedWindowLimiter
+	checkoutLimiter *fixedWindowLimiter
+	webhookLimiter  *fixedWindowLimiter
 }
 
 const (
-	defaultAccessTokenTTL  = 15 * time.Minute
-	defaultRefreshTokenTTL = 30 * 24 * time.Hour
-	defaultJWTIssuer       = "ecommerce-api"
-	defaultBcryptCost      = 12
+	defaultAccessTokenTTL            = 15 * time.Minute
+	defaultRefreshTokenTTL           = 30 * 24 * time.Hour
+	defaultJWTIssuer                 = "ecommerce-api"
+	defaultBcryptCost                = 12
+	defaultRequestTimeout            = 30 * time.Second
+	defaultReadinessWindow           = 2 * time.Second
+	defaultMaxRequestBodyBytes int64 = 2 << 20 // 2 MiB
+	defaultLoginRateLimit            = 10
+	defaultRegisterRateLimit         = 10
+	defaultRefreshRateLimit          = 30
+	defaultCheckoutRateLimit         = 20
+	defaultWebhookRateLimit          = 120
+	defaultRateLimitWindow           = time.Minute
 )
 
 func NewServer(products ProductQuerier) *Server {
@@ -88,16 +102,28 @@ func NewServer(products ProductQuerier) *Server {
 	}
 
 	return &Server{
-		products: products,
-		carts:    NewCartService(products),
-		stripe:   newStripeGateway(http.DefaultClient),
-		jwt:      jwtUtil,
-		http:     http.DefaultClient,
+		products:        products,
+		carts:           NewCartService(products),
+		stripe:          newStripeGateway(http.DefaultClient),
+		jwt:             jwtUtil,
+		http:            http.DefaultClient,
+		loginLimiter:    newFixedWindowLimiter(defaultLoginRateLimit, defaultRateLimitWindow),
+		registerLimiter: newFixedWindowLimiter(defaultRegisterRateLimit, defaultRateLimitWindow),
+		refreshLimiter:  newFixedWindowLimiter(defaultRefreshRateLimit, defaultRateLimitWindow),
+		checkoutLimiter: newFixedWindowLimiter(defaultCheckoutRateLimit, defaultRateLimitWindow),
+		webhookLimiter:  newFixedWindowLimiter(defaultWebhookRateLimit, defaultRateLimitWindow),
 	}
 }
 
 func (s *Server) Router() http.Handler {
 	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
+	r.Use(middleware.RealIP)
+	r.Use(middleware.Recoverer)
+	r.Use(limitRequestBody(defaultMaxRequestBodyBytes))
+	r.Use(requestLogger)
+	r.Use(middleware.Timeout(defaultRequestTimeout))
+	r.Use(csrfGuard)
 	r.Use(middleware.StripSlashes)
 	r.Use(s.resolveAuthUser)
 	r.Use(s.resolveGuestSession)
@@ -111,12 +137,14 @@ func (s *Server) Router() http.Handler {
 
 func (s *Server) registerRoutes(r chi.Router) {
 	r.Get("/health", s.handleHealth)
+	r.Get("/healthz", s.handleHealth)
+	r.Get("/readyz", s.handleReady)
 	r.Get("/products", s.handleListProducts)
 	r.Get("/products/{slug}", s.handleGetProductBySlug)
 	r.With(s.requireAuth).Get("/orders", s.handleListOrdersByUser)
 	r.With(s.requireAuth).Get("/orders/{id}", s.handleGetOrderByID)
-	r.Post("/auth/register", s.handleRegister)
-	r.Post("/auth/login", s.handleLogin)
+	r.With(s.rateLimitMiddleware("auth_register", s.registerLimiter, clientIPFromRequest)).Post("/auth/register", s.handleRegister)
+	r.With(s.rateLimitMiddleware("auth_login", s.loginLimiter, clientIPFromRequest)).Post("/auth/login", s.handleLogin)
 	r.Get("/auth/google/start", s.handleGoogleAuthStart)
 	r.Get("/auth/google/callback", s.handleGoogleAuthCallback)
 	r.Post("/auth/dev-login", s.handleDevLogin)
@@ -125,8 +153,8 @@ func (s *Server) registerRoutes(r chi.Router) {
 	r.Patch("/cart/items/{id}", s.handlePatchCartItem)
 	r.Delete("/cart/items/{id}", s.handleDeleteCartItem)
 	r.Get("/cart/{id}/items", s.handleGetCartItems)
-	r.With(s.requireAuth).Post("/checkout/session", s.handleCreateCheckoutSession)
-	r.Post("/webhooks/stripe", s.handleStripeWebhook)
+	r.With(s.rateLimitMiddleware("checkout_session", s.checkoutLimiter, clientIPFromRequest), s.requireAuth).Post("/checkout/session", s.handleCreateCheckoutSession)
+	r.With(s.rateLimitMiddleware("stripe_webhook", s.webhookLimiter, webhookRateLimitKey)).Post("/webhooks/stripe", s.handleStripeWebhook)
 }
 
 type productsResponse struct {
@@ -245,13 +273,14 @@ type orderItemDTO struct {
 }
 
 type googleOAuthConfig struct {
-	ClientID      string
-	ClientSecret  string
-	RedirectURL   string
-	PostLoginPath string
-	AuthURL       string
-	TokenURL      string
-	UserinfoURL   string
+	ClientID           string
+	ClientSecret       string
+	RedirectURL        string
+	PostLoginPath      string
+	PostLoginAllowlist []string
+	AuthURL            string
+	TokenURL           string
+	UserinfoURL        string
 }
 
 type googleTokenResponse struct {
@@ -267,6 +296,22 @@ type googleUserinfoResponse struct {
 
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), defaultReadinessWindow)
+	defer cancel()
+
+	_, err := s.products.ListActiveProducts(ctx, db.ListActiveProductsParams{
+		Limit:  1,
+		Offset: 0,
+	})
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
 func (s *Server) handleListProducts(w http.ResponseWriter, r *http.Request) {
@@ -679,17 +724,19 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 func readGoogleOAuthConfig() (googleOAuthConfig, bool) {
 	cfg := googleOAuthConfig{
-		ClientID:      strings.TrimSpace(os.Getenv("GOOGLE_OAUTH_CLIENT_ID")),
-		ClientSecret:  strings.TrimSpace(os.Getenv("GOOGLE_OAUTH_CLIENT_SECRET")),
-		RedirectURL:   strings.TrimSpace(os.Getenv("GOOGLE_OAUTH_REDIRECT_URL")),
-		PostLoginPath: strings.TrimSpace(os.Getenv("GOOGLE_OAUTH_POST_LOGIN_URL")),
-		AuthURL:       strings.TrimSpace(os.Getenv("GOOGLE_OAUTH_AUTH_URL")),
-		TokenURL:      strings.TrimSpace(os.Getenv("GOOGLE_OAUTH_TOKEN_URL")),
-		UserinfoURL:   strings.TrimSpace(os.Getenv("GOOGLE_OAUTH_USERINFO_URL")),
+		ClientID:           strings.TrimSpace(os.Getenv("GOOGLE_OAUTH_CLIENT_ID")),
+		ClientSecret:       strings.TrimSpace(os.Getenv("GOOGLE_OAUTH_CLIENT_SECRET")),
+		RedirectURL:        strings.TrimSpace(os.Getenv("GOOGLE_OAUTH_REDIRECT_URL")),
+		PostLoginPath:      strings.TrimSpace(os.Getenv("GOOGLE_OAUTH_POST_LOGIN_URL")),
+		PostLoginAllowlist: parseCSVAllowlist(os.Getenv("GOOGLE_OAUTH_POST_LOGIN_ALLOWLIST")),
+		AuthURL:            strings.TrimSpace(os.Getenv("GOOGLE_OAUTH_AUTH_URL")),
+		TokenURL:           strings.TrimSpace(os.Getenv("GOOGLE_OAUTH_TOKEN_URL")),
+		UserinfoURL:        strings.TrimSpace(os.Getenv("GOOGLE_OAUTH_USERINFO_URL")),
 	}
 	if cfg.PostLoginPath == "" {
 		cfg.PostLoginPath = "/catalog"
 	}
+	cfg.PostLoginPath = sanitizeOAuthPostLoginRedirect(cfg.PostLoginPath, cfg.PostLoginAllowlist)
 	if cfg.AuthURL == "" {
 		cfg.AuthURL = "https://accounts.google.com/o/oauth2/v2/auth"
 	}
@@ -703,6 +750,40 @@ func readGoogleOAuthConfig() (googleOAuthConfig, bool) {
 		return cfg, false
 	}
 	return cfg, true
+}
+
+func parseCSVAllowlist(raw string) []string {
+	parts := strings.Split(raw, ",")
+	allowed := make([]string, 0, len(parts))
+	for _, part := range parts {
+		item := strings.TrimSpace(part)
+		if item != "" {
+			allowed = append(allowed, item)
+		}
+	}
+	return allowed
+}
+
+func sanitizeOAuthPostLoginRedirect(candidate string, allowlist []string) string {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" {
+		return "/catalog"
+	}
+	if strings.HasPrefix(candidate, "/") && !strings.HasPrefix(candidate, "//") {
+		return candidate
+	}
+
+	parsed, err := url.Parse(candidate)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "/catalog"
+	}
+
+	for _, allowed := range allowlist {
+		if strings.EqualFold(candidate, strings.TrimSpace(allowed)) {
+			return candidate
+		}
+	}
+	return "/catalog"
 }
 
 func (s *Server) handleGoogleAuthStart(w http.ResponseWriter, r *http.Request) {
@@ -721,7 +802,7 @@ func (s *Server) handleGoogleAuthStart(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "failed to initialize google oauth")
 		return
 	}
-	setCookieWithTTL(w, googleOAuthStateCookieName, state, 10*time.Minute)
+	setCookieWithTTLAndSameSite(w, googleOAuthStateCookieName, state, 10*time.Minute, http.SameSiteLaxMode)
 
 	authURL, err := url.Parse(cfg.AuthURL)
 	if err != nil {
@@ -760,12 +841,12 @@ func (s *Server) handleGoogleAuthCallback(w http.ResponseWriter, r *http.Request
 	}
 
 	stateCookie, err := ReadCookie(r, googleOAuthStateCookieName)
-	if err != nil || stateCookie != state {
-		setCookieWithTTL(w, googleOAuthStateCookieName, "", -1*time.Second)
+	if err != nil || !hmac.Equal([]byte(stateCookie), []byte(state)) {
+		setCookieWithTTLAndSameSite(w, googleOAuthStateCookieName, "", -1*time.Second, http.SameSiteLaxMode)
 		http.Redirect(w, r, "/auth?error=google_state", http.StatusFound)
 		return
 	}
-	setCookieWithTTL(w, googleOAuthStateCookieName, "", -1*time.Second)
+	setCookieWithTTLAndSameSite(w, googleOAuthStateCookieName, "", -1*time.Second, http.SameSiteLaxMode)
 
 	tokenReqBody := url.Values{}
 	tokenReqBody.Set("code", code)

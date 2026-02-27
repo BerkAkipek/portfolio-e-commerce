@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -47,7 +51,33 @@ func main() {
 
 	addr := fmt.Sprintf(":%s", port)
 	log.Printf("api listening on %s", addr)
-	if err := http.ListenAndServe(addr, server.Router()); err != nil {
-		log.Fatalf("serve: %v", err)
+
+	httpServer := &http.Server{
+		Addr:              addr,
+		Handler:           server.Router(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
+
+	go func() {
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("serve: %v", err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+
+	log.Print("shutdown signal received, draining connections")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Fatalf("graceful shutdown failed: %v", err)
+	}
+	log.Print("server stopped")
 }

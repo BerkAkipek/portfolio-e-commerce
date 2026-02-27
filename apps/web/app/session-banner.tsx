@@ -2,7 +2,9 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
-import { useState } from "react";
+import { useEffect, useState } from "react";
+
+import { isLikelyNetworkError } from "@/lib/network";
 
 type SessionState = {
   authenticated: boolean;
@@ -34,12 +36,29 @@ async function logout() {
 export default function SessionBanner() {
   const queryClient = useQueryClient();
   const [message, setMessage] = useState("");
+  const [isOffline, setIsOffline] = useState(() =>
+    typeof navigator !== "undefined" ? !navigator.onLine : false,
+  );
 
   const sessionQuery = useQuery({
     queryKey: ["auth-session"],
     queryFn: fetchSessionState,
     retry: false,
   });
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const handleOnline = () => setIsOffline(false);
+    const handleOffline = () => setIsOffline(true);
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, []);
 
   const logoutMutation = useMutation({
     mutationFn: logout,
@@ -48,13 +67,28 @@ export default function SessionBanner() {
       await queryClient.invalidateQueries({ queryKey: ["auth-session"] });
     },
     onError: (error) => {
+      if (isLikelyNetworkError(error)) {
+        setMessage("Offline. Unable to sign out right now.");
+        return;
+      }
       setMessage(error instanceof Error ? error.message : "Unable to sign out.");
     },
   });
 
   const isAuthenticated = sessionQuery.data?.authenticated ?? false;
+  const sessionUnavailable = sessionQuery.isError;
+  const statusLabel = sessionUnavailable
+    ? "Session unavailable"
+    : isAuthenticated
+      ? "Signed in"
+      : "Guest session";
   const restoredMessage = sessionQuery.data?.restored
     ? "Session restored securely via refresh token rotation."
+    : "";
+  const networkMessage = sessionUnavailable
+    ? isOffline || isLikelyNetworkError(sessionQuery.error)
+      ? "Offline. Cannot refresh authentication state."
+      : "Unable to refresh authentication state."
     : "";
 
   return (
@@ -64,14 +98,18 @@ export default function SessionBanner() {
           <div className="flex items-center gap-2">
             <span
               className={`inline-flex rounded-full px-2.5 py-1 font-semibold tracking-wide uppercase ${
-                isAuthenticated
+                sessionUnavailable
+                  ? "bg-amber-300/20 text-amber-100"
+                  : isAuthenticated
                   ? "bg-emerald-300/20 text-emerald-100"
                   : "bg-slate-500/20 text-slate-200"
               }`}
             >
-              {isAuthenticated ? "Signed in" : "Guest session"}
+              {statusLabel}
             </span>
-            {restoredMessage ? (
+            {networkMessage ? (
+              <span className="text-amber-100">{networkMessage}</span>
+            ) : restoredMessage ? (
               <span className="text-cyan-100">{restoredMessage}</span>
             ) : message ? (
               <span className="text-slate-200">{message}</span>
@@ -83,6 +121,15 @@ export default function SessionBanner() {
         </div>
 
         <div className="flex items-center gap-2">
+          {sessionUnavailable ? (
+            <button
+              type="button"
+              onClick={() => sessionQuery.refetch()}
+              className="rounded-full border border-white/25 px-3 py-1.5 font-semibold text-slate-100 transition hover:border-cyan-300/80 hover:text-white"
+            >
+              Retry
+            </button>
+          ) : null}
           {!isAuthenticated ? (
             <Link
               href="/auth"

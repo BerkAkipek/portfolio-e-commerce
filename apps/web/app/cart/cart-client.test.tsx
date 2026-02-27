@@ -320,4 +320,19 @@ describe("CartClient", () => {
       );
     });
   });
+
+  it("shows offline-friendly cart load error and retry action", async () => {
+    window.localStorage.setItem(GUEST_CART_STORAGE_KEY, "cart-network");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockRejectedValue(new TypeError("Failed to fetch")),
+    );
+
+    renderCart();
+
+    expect(
+      await screen.findByText("You appear offline. Reconnect to load your cart."),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+  });
 });

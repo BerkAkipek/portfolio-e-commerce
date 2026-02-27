@@ -24,6 +24,7 @@ const (
 	authCookieName             = "access_token"
 	guestSessionCookieName     = "guest_session_id"
 	refreshCookieName          = "refresh_token"
+	csrfCookieName             = "csrf_token"
 	googleOAuthStateCookieName = "google_oauth_state"
 )
 
@@ -213,6 +214,10 @@ func (j *JWTUtility) sign(input string) string {
 }
 
 func setCookieWithTTL(w http.ResponseWriter, name, value string, ttl time.Duration) {
+	setCookieWithTTLAndSameSite(w, name, value, ttl, resolveCookieSameSite())
+}
+
+func setCookieWithTTLAndSameSite(w http.ResponseWriter, name, value string, ttl time.Duration, sameSite http.SameSite) {
 	maxAge := int(ttl.Seconds())
 	if maxAge < 0 {
 		maxAge = -1
@@ -221,13 +226,18 @@ func setCookieWithTTL(w http.ResponseWriter, name, value string, ttl time.Durati
 	if maxAge == -1 {
 		expires = time.Unix(0, 0)
 	}
+	secure := isSecureCookieEnabled()
+	// Browsers reject SameSite=None without Secure. Fall back to Lax defensively.
+	if sameSite == http.SameSiteNoneMode && !secure {
+		sameSite = http.SameSiteLaxMode
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     name,
 		Value:    value,
 		Path:     "/",
 		HttpOnly: true,
-		Secure:   isSecureCookieEnabled(),
-		SameSite: http.SameSiteLaxMode,
+		Secure:   secure,
+		SameSite: sameSite,
 		MaxAge:   maxAge,
 		Expires:  expires,
 	})
@@ -286,6 +296,10 @@ func GenerateGuestSessionID() string {
 
 func SetGuestSessionCookie(w http.ResponseWriter, sessionID string) {
 	setCookieWithTTL(w, guestSessionCookieName, sessionID, 30*24*time.Hour)
+}
+
+func SetCSRFCookie(w http.ResponseWriter, token string) {
+	setCookieWithTTL(w, csrfCookieName, token, 30*24*time.Hour)
 }
 
 func ReadGuestSessionCookie(r *http.Request) (string, error) {
@@ -350,6 +364,7 @@ func (s *Server) resolveAuthUser(next http.Handler) http.Handler {
 func (s *Server) resolveGuestSession(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if actor, ok := ActorFromContext(r.Context()); ok && actor.ActorType == ActorTypeUser && actor.UserID != uuid.Nil {
+			ensureCSRFCookie(w, r)
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -359,6 +374,7 @@ func (s *Server) resolveGuestSession(next http.Handler) http.Handler {
 			sessionID = GenerateGuestSessionID()
 			SetGuestSessionCookie(w, sessionID)
 		}
+		ensureCSRFCookie(w, r)
 
 		actor := Actor{
 			ActorType: ActorTypeSession,
@@ -367,6 +383,15 @@ func (s *Server) resolveGuestSession(next http.Handler) http.Handler {
 		ctx := context.WithValue(r.Context(), actorContextKey{}, actor)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+func ensureCSRFCookie(w http.ResponseWriter, r *http.Request) {
+	if _, err := ReadCookie(r, csrfCookieName); err == nil {
+		return
+	}
+	if csrfToken, genErr := GenerateRefreshToken(); genErr == nil {
+		SetCSRFCookie(w, csrfToken)
+	}
 }
 
 func (s *Server) resolveActor(next http.Handler) http.Handler {
@@ -416,6 +441,13 @@ func (s *Server) requireAuth(next http.Handler) http.Handler {
 			ClearAuthCookies(w)
 			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
+		}
+		if s.refreshLimiter != nil {
+			rateLimitKey := "refresh_token_rotation:" + clientIPFromRequest(r)
+			if !s.refreshLimiter.allow(rateLimitKey) {
+				writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
+				return
+			}
 		}
 
 		newRefreshRaw, err := GenerateRefreshToken()
@@ -475,6 +507,19 @@ func isSecureCookieEnabled() bool {
 		return true
 	}
 	return strings.EqualFold(os.Getenv("COOKIE_SECURE"), "true")
+}
+
+func resolveCookieSameSite() http.SameSite {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("COOKIE_SAMESITE"))) {
+	case "strict":
+		return http.SameSiteStrictMode
+	case "none":
+		return http.SameSiteNoneMode
+	case "lax", "":
+		return http.SameSiteLaxMode
+	default:
+		return http.SameSiteLaxMode
+	}
 }
 
 func isDevelopmentAuthEnabled() bool {

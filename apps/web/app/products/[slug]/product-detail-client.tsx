@@ -6,6 +6,7 @@ import Link from "next/link";
 import { useMemo, useState } from "react";
 
 import { GUEST_CART_STORAGE_KEY } from "@/lib/cart";
+import { addToCart } from "@/lib/storefront-api";
 
 type Product = {
   id: string;
@@ -46,24 +47,6 @@ async function fetchProductBySlug(slug: string): Promise<ProductResponse> {
     throw new Error("failed to load product");
   }
   return (await response.json()) as ProductResponse;
-}
-
-async function addToCart(productID: string, quantity: number) {
-  const response = await fetch("/api/cart/items", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ product_id: productID, quantity }),
-  });
-
-  const payload = (await response.json()) as {
-    data?: { cart_id?: string };
-    error?: string;
-  };
-  if (!response.ok) {
-    throw new Error(payload.error || "failed to add to cart");
-  }
-
-  return payload;
 }
 
 function buildImageGallery(product: Product) {

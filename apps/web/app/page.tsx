@@ -1,31 +1,5 @@
 import Link from "next/link";
-
-const featuredProducts = [
-  {
-    name: "Aero Running Jacket",
-    category: "Outerwear",
-    price: "$129",
-    accent: "from-cyan-500/25 to-cyan-300/5",
-  },
-  {
-    name: "Core Training Set",
-    category: "Performance",
-    price: "$89",
-    accent: "from-emerald-500/25 to-emerald-300/5",
-  },
-  {
-    name: "Urban Carry Pack",
-    category: "Accessories",
-    price: "$74",
-    accent: "from-sky-500/25 to-sky-300/5",
-  },
-  {
-    name: "Flex Everyday Tee",
-    category: "Essentials",
-    price: "$32",
-    accent: "from-teal-500/25 to-teal-300/5",
-  },
-];
+import HomeFeaturedProducts from "./home-featured-products";
 
 const collections = ["New Arrivals", "Best Sellers", "Men", "Women", "Accessories"];
 
@@ -128,27 +102,7 @@ export default function Home() {
               View all products
             </Link>
           </div>
-          <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-4">
-            {featuredProducts.map((product, idx) => (
-              <article
-                key={product.name}
-                className="animate-fade-in-up rounded-3xl border border-white/12 bg-white/5 p-4"
-                style={{ animationDelay: `${280 + idx * 100}ms` }}
-              >
-                <div
-                  className={`mb-4 h-40 rounded-2xl border border-white/10 bg-gradient-to-br ${product.accent}`}
-                />
-                <p className="text-xs tracking-[0.14em] text-slate-400 uppercase">{product.category}</p>
-                <h3 className="mt-1 text-base font-semibold text-white">{product.name}</h3>
-                <div className="mt-4 flex items-center justify-between">
-                  <p className="text-sm font-semibold text-cyan-200">{product.price}</p>
-                  <button className="rounded-full border border-white/15 px-3 py-1.5 text-xs font-medium text-slate-200 transition hover:border-cyan-300/70 hover:text-white">
-                    Add to cart
-                  </button>
-                </div>
-              </article>
-            ))}
-          </div>
+          <HomeFeaturedProducts />
         </section>
       </main>
     </div>
