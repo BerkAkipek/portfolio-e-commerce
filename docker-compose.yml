@@ -61,8 +61,11 @@ services:
       PORT: "8080"
       JWT_SECRET: dev-local-jwt-secret
       APP_ENV: development
+      GOOGLE_OAUTH_CLIENT_ID: ${GOOGLE_OAUTH_CLIENT_ID:-}
+      GOOGLE_OAUTH_CLIENT_SECRET: ${GOOGLE_OAUTH_CLIENT_SECRET:-}
       GOOGLE_OAUTH_REDIRECT_URL: http://localhost:3000/api/auth/google/callback
       GOOGLE_OAUTH_POST_LOGIN_URL: /catalog
+      GOOGLE_OAUTH_POST_LOGIN_ALLOWLIST: ${GOOGLE_OAUTH_POST_LOGIN_ALLOWLIST:-http://localhost:3000}
       CHECKOUT_SUCCESS_URL: http://localhost:3000/checkout/success
       CHECKOUT_CANCEL_URL: http://localhost:3000/checkout/cancel
     ports:
@@ -80,6 +83,7 @@ services:
     environment:
       NODE_ENV: production
       PORT: "3000"
+      API_URL: http://api:8080
       NEXT_PUBLIC_API_URL: http://localhost:8080
     ports:
       - "3000:3000"

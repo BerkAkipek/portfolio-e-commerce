@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 
 export function getApiBaseURL(): string {
-  const base = process.env.NEXT_PUBLIC_API_URL?.trim();
+  const base = process.env.API_URL?.trim() ?? process.env.NEXT_PUBLIC_API_URL?.trim();
   return base && base.length > 0 ? base : "http://localhost:8080";
 }
 
