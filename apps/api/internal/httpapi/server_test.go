@@ -766,6 +766,46 @@ func TestLoginSuccessSetsCookiesAndNoTokensInBody(t *testing.T) {
 	}
 }
 
+func TestAuthSessionRequiresAuthenticatedUser(t *testing.T) {
+	t.Setenv("JWT_SECRET", "resolve-secret")
+	server := NewServer(&fakeProductQuerier{})
+
+	req := httptest.NewRequest(http.MethodGet, "/auth/session", nil)
+	rr := httptest.NewRecorder()
+	server.Router().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected status 401, got %d", rr.Code)
+	}
+}
+
+func TestAuthSessionReturnsAuthenticated(t *testing.T) {
+	t.Setenv("JWT_SECRET", "resolve-secret")
+	userID := uuid.MustParse("00000000-0000-0000-0000-000000000907")
+	server := NewServer(&fakeProductQuerier{})
+
+	token, err := server.jwt.CreateToken(userID)
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/auth/session", nil)
+	req.AddCookie(&http.Cookie{Name: authCookieName, Value: token})
+	rr := httptest.NewRecorder()
+	server.Router().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", rr.Code)
+	}
+	var body map[string]bool
+	if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+		t.Fatalf("decode response body: %v", err)
+	}
+	if !body["authenticated"] {
+		t.Fatalf("expected authenticated=true, got %+v", body)
+	}
+}
+
 func TestLoginInvalidCredentials(t *testing.T) {
 	t.Setenv("JWT_SECRET", "resolve-secret")
 	hash, err := bcrypt.GenerateFromPassword([]byte("correct-password"), bcrypt.DefaultCost)
@@ -1572,6 +1612,58 @@ func TestCreateCheckoutSessionResolveCartError(t *testing.T) {
 
 	if rr.Code != http.StatusInternalServerError {
 		t.Fatalf("expected status 500, got %d", rr.Code)
+	}
+}
+
+func TestCreateCheckoutSessionRejectsUntrustedRedirectURL(t *testing.T) {
+	t.Setenv("STRIPE_SECRET_KEY", "sk_test_123")
+	t.Setenv("CHECKOUT_SUCCESS_URL", "https://example.com/success")
+	t.Setenv("CHECKOUT_CANCEL_URL", "https://example.com/cancel")
+	t.Setenv("JWT_SECRET", "resolve-secret")
+
+	cartID := uuid.MustParse("00000000-0000-0000-0000-000000000141")
+	userID := uuid.MustParse("00000000-0000-0000-0000-000000000142")
+	productID := uuid.MustParse("00000000-0000-0000-0000-000000000143")
+	store := &fakeProductQuerier{
+		cart: db.Cart{
+			ID:     cartID,
+			UserID: uuid.NullUUID{UUID: userID, Valid: true},
+			Status: "active",
+		},
+		listItems: []db.CartItem{{
+			ID:                 uuid.MustParse("00000000-0000-0000-0000-000000000144"),
+			CartID:             cartID,
+			ProductID:          productID,
+			Quantity:           1,
+			PriceCentsSnapshot: 1999,
+		}},
+		product: db.Product{
+			ID:       productID,
+			Name:     "Basic Tee",
+			Currency: "USD",
+			IsActive: true,
+		},
+	}
+
+	server := NewServer(store)
+	token, err := server.jwt.CreateToken(userID)
+	if err != nil {
+		t.Fatalf("create token: %v", err)
+	}
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/checkout/session",
+		strings.NewReader(`{"success_url":"https://evil.example/success","cancel_url":"https://evil.example/cancel"}`),
+	)
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: authCookieName, Value: token})
+	rr := httptest.NewRecorder()
+
+	server.Router().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d", rr.Code)
 	}
 }
 

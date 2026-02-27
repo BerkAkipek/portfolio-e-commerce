@@ -145,6 +145,7 @@ func (s *Server) registerRoutes(r chi.Router) {
 	r.With(s.requireAuth).Get("/orders/{id}", s.handleGetOrderByID)
 	r.With(s.rateLimitMiddleware("auth_register", s.registerLimiter, clientIPFromRequest)).Post("/auth/register", s.handleRegister)
 	r.With(s.rateLimitMiddleware("auth_login", s.loginLimiter, clientIPFromRequest)).Post("/auth/login", s.handleLogin)
+	r.With(s.requireAuth).Get("/auth/session", s.handleAuthSession)
 	r.Get("/auth/google/start", s.handleGoogleAuthStart)
 	r.Get("/auth/google/callback", s.handleGoogleAuthCallback)
 	r.Post("/auth/dev-login", s.handleDevLogin)
@@ -664,6 +665,15 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"success": true})
 }
 
+func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
+	userID, ok := AuthUserIDFromContext(r.Context())
+	if !ok || userID == uuid.Nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"authenticated": true})
+}
+
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if s.jwt == nil {
 		writeError(w, http.StatusServiceUnavailable, "jwt auth is not configured")
@@ -918,6 +928,10 @@ func (s *Server) handleGoogleAuthCallback(w http.ResponseWriter, r *http.Request
 		http.Redirect(w, r, "/auth?error=google_email_missing", http.StatusFound)
 		return
 	}
+	if !userinfo.EmailVerified {
+		http.Redirect(w, r, "/auth?error=google_email_unverified", http.StatusFound)
+		return
+	}
 
 	user, err := s.products.GetUserByEmail(r.Context(), email)
 	if err != nil {
@@ -1058,16 +1072,25 @@ func (s *Server) handleCreateCheckoutSession(w http.ResponseWriter, r *http.Requ
 		})
 	}
 
-	successURL := req.SuccessURL
+	defaultSuccessURL := strings.TrimSpace(os.Getenv("CHECKOUT_SUCCESS_URL"))
+	defaultCancelURL := strings.TrimSpace(os.Getenv("CHECKOUT_CANCEL_URL"))
+	allowedRedirects := parseCSVAllowlist(os.Getenv("CHECKOUT_URL_ALLOWLIST"))
+	allowedRedirects = append(allowedRedirects, defaultSuccessURL, defaultCancelURL)
+
+	successURL := strings.TrimSpace(req.SuccessURL)
 	if successURL == "" {
-		successURL = os.Getenv("CHECKOUT_SUCCESS_URL")
+		successURL = defaultSuccessURL
 	}
-	cancelURL := req.CancelURL
+	cancelURL := strings.TrimSpace(req.CancelURL)
 	if cancelURL == "" {
-		cancelURL = os.Getenv("CHECKOUT_CANCEL_URL")
+		cancelURL = defaultCancelURL
 	}
 	if successURL == "" || cancelURL == "" {
 		writeError(w, http.StatusInternalServerError, "checkout URLs are not configured")
+		return
+	}
+	if !isAllowedCheckoutRedirect(successURL, allowedRedirects) || !isAllowedCheckoutRedirect(cancelURL, allowedRedirects) {
+		writeError(w, http.StatusBadRequest, "invalid checkout redirect url")
 		return
 	}
 
@@ -1215,11 +1238,40 @@ func (s *Server) handleStripeWebhook(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) processCheckoutSessionCompleted(ctx context.Context, session stripeCheckoutSession) error {
+	type txCapableStore interface {
+		BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
+		WithTx(*sql.Tx) *db.Queries
+	}
+
+	if store, ok := s.products.(txCapableStore); ok {
+		tx, err := store.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+
+		txStore := store.WithTx(tx)
+		err = s.processCheckoutSessionCompletedWithStore(ctx, txStore, session)
+		if err != nil {
+			_ = tx.Rollback()
+			if errors.Is(err, errWebhookAlreadyProcessed) {
+				return nil
+			}
+			return err
+		}
+		return tx.Commit()
+	}
+
+	return s.processCheckoutSessionCompletedWithStore(ctx, s.products, session)
+}
+
+var errWebhookAlreadyProcessed = errors.New("webhook already processed")
+
+func (s *Server) processCheckoutSessionCompletedWithStore(ctx context.Context, store ProductQuerier, session stripeCheckoutSession) error {
 	if session.ID == "" {
 		return errors.New("checkout session id is required")
 	}
 
-	_, err := s.products.GetPaymentByCheckoutSessionID(ctx, session.ID)
+	_, err := store.GetPaymentByCheckoutSessionID(ctx, session.ID)
 	if err == nil {
 		return nil
 	}
@@ -1233,7 +1285,7 @@ func (s *Server) processCheckoutSessionCompleted(ctx context.Context, session st
 		return fmt.Errorf("invalid cart id in metadata: %w", err)
 	}
 
-	cart, err := s.products.GetCartByID(ctx, cartID)
+	cart, err := store.GetCartByID(ctx, cartID)
 	if err != nil {
 		return err
 	}
@@ -1244,7 +1296,7 @@ func (s *Server) processCheckoutSessionCompleted(ctx context.Context, session st
 		return errors.New("cart is not attached to a user")
 	}
 
-	cartItems, err := s.products.ListCartItemsByCartID(ctx, cartID)
+	cartItems, err := store.ListCartItemsByCartID(ctx, cartID)
 	if err != nil {
 		return err
 	}
@@ -1254,18 +1306,20 @@ func (s *Server) processCheckoutSessionCompleted(ctx context.Context, session st
 
 	var subtotal int64
 	currency := ""
+	productNames := make(map[uuid.UUID]string, len(cartItems))
 	for _, item := range cartItems {
-		product, productErr := s.products.GetProductByID(ctx, item.ProductID)
+		product, productErr := store.GetProductByID(ctx, item.ProductID)
 		if productErr != nil {
 			return productErr
 		}
 		if currency == "" {
 			currency = strings.ToUpper(product.Currency)
 		}
+		productNames[item.ProductID] = product.Name
 		subtotal += int64(item.PriceCentsSnapshot) * int64(item.Quantity)
 	}
 
-	order, err := s.products.CreateOrder(ctx, db.CreateOrderParams{
+	order, err := store.CreateOrder(ctx, db.CreateOrderParams{
 		UserID:        cart.UserID.UUID,
 		Status:        "paid",
 		Currency:      currency,
@@ -1277,14 +1331,10 @@ func (s *Server) processCheckoutSessionCompleted(ctx context.Context, session st
 	}
 
 	for _, item := range cartItems {
-		product, productErr := s.products.GetProductByID(ctx, item.ProductID)
-		if productErr != nil {
-			return productErr
-		}
-		if _, err := s.products.CreateOrderItem(ctx, db.CreateOrderItemParams{
+		if _, err := store.CreateOrderItem(ctx, db.CreateOrderItemParams{
 			OrderID:             order.ID,
 			ProductID:           item.ProductID,
-			ProductNameSnapshot: product.Name,
+			ProductNameSnapshot: productNames[item.ProductID],
 			PriceCentsSnapshot:  item.PriceCentsSnapshot,
 			Quantity:            item.Quantity,
 		}); err != nil {
@@ -1306,7 +1356,7 @@ func (s *Server) processCheckoutSessionCompleted(ctx context.Context, session st
 		paymentCurrency = currency
 	}
 
-	if _, err := s.products.CreatePayment(ctx, db.CreatePaymentParams{
+	if _, err := store.CreatePayment(ctx, db.CreatePaymentParams{
 		OrderID:           order.ID,
 		Provider:          "stripe",
 		ProviderPaymentID: sql.NullString{String: providerPaymentID, Valid: true},
@@ -1316,10 +1366,13 @@ func (s *Server) processCheckoutSessionCompleted(ctx context.Context, session st
 		CheckoutSessionID: sql.NullString{String: session.ID, Valid: true},
 		PaymentIntentID:   sql.NullString{String: session.PaymentIntent, Valid: session.PaymentIntent != ""},
 	}); err != nil {
+		if isUniqueViolation(err) {
+			return errWebhookAlreadyProcessed
+		}
 		return err
 	}
 
-	if _, err := s.products.UpdateCartStatus(ctx, db.UpdateCartStatusParams{
+	if _, err := store.UpdateCartStatus(ctx, db.UpdateCartStatusParams{
 		ID:     cartID,
 		Status: "converted",
 	}); err != nil {
@@ -1327,12 +1380,37 @@ func (s *Server) processCheckoutSessionCompleted(ctx context.Context, session st
 	}
 
 	for _, item := range cartItems {
-		if err := s.products.RemoveCartItem(ctx, item.ID); err != nil {
+		if err := store.RemoveCartItem(ctx, item.ID); err != nil {
 			return err
 		}
 	}
 
 	return nil
+}
+
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
+func isAllowedCheckoutRedirect(rawURL string, allowlist []string) bool {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return false
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return false
+	}
+	if len(allowlist) == 0 {
+		return true
+	}
+	for _, allowed := range allowlist {
+		if strings.EqualFold(rawURL, strings.TrimSpace(allowed)) {
+			return true
+		}
+	}
+	return false
 }
 
 type stripeGateway interface {

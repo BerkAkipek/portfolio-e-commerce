@@ -33,8 +33,8 @@ describe("GET /api/auth/session", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
-        new Response(JSON.stringify({ error: "cart is empty" }), {
-          status: 400,
+        new Response(JSON.stringify({ authenticated: true }), {
+          status: 200,
           headers: {
             "content-type": "application/json",
             "set-cookie": "access_token=rotated-a; Path=/, refresh_token=rotated-r; Path=/",
@@ -51,6 +51,27 @@ describe("GET /api/auth/session", () => {
     await expect(response.json()).resolves.toEqual({
       authenticated: true,
       restored: true,
+    });
+  });
+
+  it("reports authenticated=false on non-401 upstream errors", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ error: "upstream failure" }), {
+          status: 500,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    );
+
+    const request = new NextRequest("http://localhost/api/auth/session");
+    const response = await GET(request);
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({
+      authenticated: false,
+      restored: false,
     });
   });
 

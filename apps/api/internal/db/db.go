@@ -7,6 +7,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 )
 
 type DBTX interface {
@@ -28,4 +29,15 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 	return &Queries{
 		db: tx,
 	}
+}
+
+func (q *Queries) BeginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, error) {
+	type txBeginner interface {
+		BeginTx(context.Context, *sql.TxOptions) (*sql.Tx, error)
+	}
+	beginner, ok := q.db.(txBeginner)
+	if !ok {
+		return nil, errors.New("transactions are not supported by this query store")
+	}
+	return beginner.BeginTx(ctx, opts)
 }

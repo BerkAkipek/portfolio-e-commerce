@@ -18,25 +18,21 @@ function hasRotatedAuthCookies(setCookieHeader: string | null): boolean {
 }
 
 export async function GET(request: NextRequest) {
-  const upstreamURL = new URL("/checkout/session", getApiBaseURL());
-  const csrfToken = request.cookies.get("csrf_token")?.value?.trim();
+  const upstreamURL = new URL("/auth/session", getApiBaseURL());
 
   try {
     const response = await fetch(upstreamURL, {
-      method: "POST",
+      method: "GET",
       cache: "no-store",
       headers: {
-        "Content-Type": "application/json",
         Accept: "application/json",
         Cookie: request.headers.get("cookie") ?? "",
-        ...(csrfToken ? { "X-CSRF-Token": csrfToken } : {}),
       },
-      body: JSON.stringify({}),
     });
 
     const setCookie = response.headers.get("set-cookie");
     const restored = hasRotatedAuthCookies(setCookie);
-    const authenticated = response.status !== 401;
+    const authenticated = response.status === 200;
 
     const payload: SessionProbeResponse = { authenticated, restored };
     const proxied = NextResponse.json(payload, { status: 200 });

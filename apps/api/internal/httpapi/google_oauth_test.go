@@ -175,6 +175,48 @@ func TestGoogleAuthCallbackRejectsStateMismatch(t *testing.T) {
 	}
 }
 
+func TestGoogleAuthCallbackRejectsUnverifiedEmail(t *testing.T) {
+	t.Setenv("JWT_SECRET", "resolve-secret")
+	t.Setenv("GOOGLE_OAUTH_CLIENT_ID", "client-id")
+	t.Setenv("GOOGLE_OAUTH_CLIENT_SECRET", "client-secret")
+	t.Setenv("GOOGLE_OAUTH_REDIRECT_URL", "http://localhost:3000/api/auth/google/callback")
+	t.Setenv("GOOGLE_OAUTH_TOKEN_URL", "https://oauth.example.test/token")
+	t.Setenv("GOOGLE_OAUTH_USERINFO_URL", "https://oauth.example.test/userinfo")
+
+	server := NewServer(&fakeProductQuerier{})
+	server.http = &http.Client{
+		Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.String() == "https://oauth.example.test/token" {
+				return jsonHTTPResponse(http.StatusOK, map[string]any{
+					"access_token": "google-access-token",
+					"token_type":   "Bearer",
+				}), nil
+			}
+			if req.URL.String() == "https://oauth.example.test/userinfo" {
+				return jsonHTTPResponse(http.StatusOK, map[string]any{
+					"email":          "google-user@example.com",
+					"email_verified": false,
+					"name":           "Google User",
+				}), nil
+			}
+			t.Fatalf("unexpected oauth request url: %s", req.URL.String())
+			return nil, nil
+		}),
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/auth/google/callback?code=test-code&state=state-1", nil)
+	req.AddCookie(&http.Cookie{Name: googleOAuthStateCookieName, Value: "state-1"})
+	rr := httptest.NewRecorder()
+
+	server.Router().ServeHTTP(rr, req)
+	if rr.Code != http.StatusFound {
+		t.Fatalf("expected status 302, got %d", rr.Code)
+	}
+	if rr.Header().Get("Location") != "/auth?error=google_email_unverified" {
+		t.Fatalf("expected unverified email redirect, got %s", rr.Header().Get("Location"))
+	}
+}
+
 func dbUser(id string, email string) db.User {
 	return db.User{
 		ID:    uuid.MustParse(id),

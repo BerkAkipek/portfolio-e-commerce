@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5/middleware"
@@ -47,7 +48,7 @@ func requestLogger(next http.Handler) http.Handler {
 			"request_id":  middleware.GetReqID(r.Context()),
 			"method":      r.Method,
 			"path":        r.URL.Path,
-			"query":       r.URL.RawQuery,
+			"query":       redactSensitiveQuery(r.URL.Path, r.URL.RawQuery),
 			"status":      rec.status,
 			"bytes":       rec.bytes,
 			"duration_ms": time.Since(start).Milliseconds(),
@@ -62,6 +63,14 @@ func requestLogger(next http.Handler) http.Handler {
 		}
 		log.Print(string(line))
 	})
+}
+
+func redactSensitiveQuery(path string, rawQuery string) string {
+	path = strings.ToLower(strings.TrimSpace(path))
+	if strings.HasSuffix(path, "/auth/google/callback") {
+		return "[redacted]"
+	}
+	return rawQuery
 }
 
 func limitRequestBody(maxBytes int64) func(http.Handler) http.Handler {

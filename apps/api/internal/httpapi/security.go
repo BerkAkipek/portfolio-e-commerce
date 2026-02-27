@@ -21,7 +21,10 @@ type fixedWindowLimiter struct {
 
 	mu    sync.Mutex
 	state map[string]fixedWindowState
+	calls uint64
 }
+
+const maxRateLimiterKeys = 10000
 
 func newFixedWindowLimiter(limit int, window time.Duration) *fixedWindowLimiter {
 	if limit <= 0 {
@@ -45,6 +48,10 @@ func (l *fixedWindowLimiter) allow(key string) bool {
 
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.calls++
+	if l.calls%256 == 0 || len(l.state) > maxRateLimiterKeys {
+		l.prune(now)
+	}
 
 	item, ok := l.state[key]
 	if !ok || now.After(item.resetAt) {
@@ -60,6 +67,23 @@ func (l *fixedWindowLimiter) allow(key string) bool {
 	item.count++
 	l.state[key] = item
 	return true
+}
+
+func (l *fixedWindowLimiter) prune(now time.Time) {
+	for key, item := range l.state {
+		if now.After(item.resetAt) {
+			delete(l.state, key)
+		}
+	}
+	if len(l.state) <= maxRateLimiterKeys {
+		return
+	}
+	for key := range l.state {
+		delete(l.state, key)
+		if len(l.state) <= maxRateLimiterKeys {
+			break
+		}
+	}
 }
 
 func clientIPFromRequest(r *http.Request) string {
